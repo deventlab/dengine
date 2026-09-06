@@ -1041,8 +1041,12 @@ async fn test_poisoned_survives_reset() {
 
 /// A `persist_entries()` (page-cache write) failure poisons the log, exactly
 /// like an fsync failure does — these are two independent failure surfaces
-/// (see `IOTask::Persist` vs `FsyncCoordinator::run_until_caught_up`)
-/// and both must reach the same fatal outcome.
+/// (`persist_pending_range` vs `FsyncCoordinator::run_until_caught_up`) and
+/// both must reach the same fatal outcome.
+///
+/// The persist runs on the IO thread off `append_entries`'s task, so the
+/// poison lands asynchronously — the black-box guarantee is that the *next*
+/// write is rejected, not that this one fails.
 ///
 /// Without this test, a bug that only wires up ONE of the two poisoning
 /// paths (e.g. fsync failures poison correctly, but persist_entries
@@ -1067,20 +1071,18 @@ async fn test_persist_entries_failure_poisons() {
     let raft_log = raft_log.start(receiver, None);
     std::thread::sleep(Duration::from_millis(10)); // ensure IO thread is ready
 
-    // append_entries() routes the write through IOTask::Persist and awaits
-    // the IO thread's reply — a persist failure now surfaces synchronously,
-    // right here, not discovered later by some other task.
-    let result = raft_log
+    // Notifies the IO thread, which runs persist_pending_range and hits the
+    // mock's first (failing) persist_entries() — the persist_pending_range
+    // poisoning path, not FsyncCoordinator's.
+    raft_log
         .append_entries(vec![Entry {
             index: 1,
             term: 1,
             payload: None,
         }])
-        .await;
-    assert!(
-        result.is_err(),
-        "a persist_entries() failure must surface synchronously from append_entries()"
-    );
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(20)).await; // let the IO thread process it
 
     assert!(
         raft_log.is_poisoned(),
@@ -1100,68 +1102,6 @@ async fn test_persist_entries_failure_poisons() {
         result.is_err(),
         "append_entries() must reject writes once poisoned"
     );
-}
-
-/// `IOTask::Persist`'s own `is_poisoned()` guard (top of its handler, on the
-/// IO thread) is a *different* check from `append_entries()`'s caller-side
-/// fast-fail (line ~471) — that one only protects writes submitted *after*
-/// poisoning already happened. This test targets the IO-thread-side guard
-/// specifically, for a `Persist` task that was already queued *before* the
-/// log got poisoned by something else (e.g. a concurrent ReplaceRange/Purge
-/// failure): send `IOTask::Persist` directly through `command_sender`,
-/// bypassing `append_entries()` entirely. Uses a plain always-succeeds mock
-/// (`with_id`, no call-count requirement) — if the IO-thread-side guard is
-/// missing or removed, `persist_entries()` would run and `done` would carry
-/// `Ok(())` instead of the expected "...poisoned..." error, which the
-/// `other => panic!` arm below catches either way.
-#[tokio::test]
-async fn test_poisoned_rejects_queued_persist_task() {
-    let storage = Arc::new(MockStorageEngine::with_id(
-        "poisoned_rejects_queued_persist_task".into(),
-    ));
-    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
-        1,
-        PersistenceConfig {
-            flush_policy: FlushPolicy::Batch {
-                idle_flush_interval_ms: 60_000,
-            },
-            shutdown_timeout_ms: 5000,
-        },
-        storage,
-    );
-    let raft_log = raft_log.start(receiver, None);
-    std::thread::sleep(Duration::from_millis(10));
-
-    // Poisoned by something unrelated to this Persist task — simulated
-    // directly, same as the other `test_poisoned_skips_*` tests in this file.
-    raft_log.poisoned.store(true, Ordering::SeqCst);
-
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    raft_log
-        .command_sender
-        .send(IOTask::Persist {
-            entries: vec![Entry {
-                index: 1,
-                term: 1,
-                payload: None,
-            }],
-            done: done_tx,
-        })
-        .expect("IO thread must still be alive to receive the task");
-
-    let result = done_rx.await.expect("IO thread must reply, not drop the sender");
-    match result {
-        Err(Error::Fatal(msg)) => assert!(
-            msg.contains("poisoned"),
-            "expected the poisoned short-circuit to fire before persist_entries() \
-             was ever called, got: {msg}"
-        ),
-        other => panic!(
-            "expected Err(Fatal(\"...poisoned...\")), got: {other:?} — this means \
-             the IO-thread-side is_poisoned() guard did not fire and \
-             persist_entries() ran anyway",
-        ),
-    }
 }
 
 /// If `notify_fatal`'s underlying channel is already closed when a failure

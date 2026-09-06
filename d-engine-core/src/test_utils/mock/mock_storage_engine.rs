@@ -640,9 +640,9 @@ impl MockStorageEngine {
     /// their always-succeeds default (`configure_durable`) — this gate is only
     /// about the write-to-storage-engine step, not fsync.
     ///
-    /// Use this to make the ordering between `append_entries()` returning and the
-    /// entry actually reaching the storage engine deterministic (no sleep/race) —
-    /// see `process_crash_safety_test.rs`.
+    /// Use this to freeze the IO thread mid-persist so a concurrent truncation
+    /// can be driven deterministically — see
+    /// `durable_index_truncation_clamp_test.rs`.
     pub fn not_durable_gated_persist(id: String) -> (Self, std::sync::mpsc::Sender<()>) {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let rx = Mutex::new(Some(rx));

@@ -1,27 +1,13 @@
-//! Content-validated `durable_index` advance (#446/#447 single-owner
-//! redesign). Tests `try_advance_durable_index(&self, index: u64, term: u64)
-//! -> Option<u64>` — `Some(new_value)` only when it actually advanced,
-//! `None` when rejected as stale (`entry_term(index) != Some(term)`) or
-//! already applied.
+//! Content-validated `durable_index` advance (#446 single-owner redesign).
+//! Tests `try_advance_durable_index(index, term) -> Option<u64>`:
+//! `Some(new)` only when it actually advanced, `None` when rejected as stale
+//! (`entry_term(index) != Some(term)`) or already applied.
 //!
-//! Not wired into the mod tree yet — add
-//! `#[path = "buffered_raft_log_test/content_validated_watermark_test.rs"]
-//! mod content_validated_watermark_test;` to `buffered_raft_log.rs` next to
-//! the other test module declarations.
-//!
-//! Why these tests don't need thread races or timing gates (unlike
-//! `truncation_fsync_fence_test.rs`): under single ownership, the report and
-//! the truncation are just two sequential calls in whatever order they
-//! happen to arrive — no interleaving *inside* a function body is possible
-//! because there's only one caller. Each test below drives one arrival order
-//! directly.
-//!
-//! `persisted_index` has no equivalent test here — it doesn't need content
-//! validation. Its only writer is now the IO thread (B), processing
-//! `IOTask::Persist`/`ReplaceRange` strictly in the order the single owner
-//! (A) issued them (each `await`ed before the next is sent), so there's no
-//! stale-message window the way there is for `durable_index`'s async,
-//! un-awaited fsync-completion report.
+//! Why no thread races / timing gates here (unlike `truncation_fsync_fence_test.rs`):
+//! `durable_index` has one owner — raft.rs's event loop. The fsync-completion
+//! report and a truncation are just two sequential calls on that thread, so no
+//! interleaving inside a function body is possible. Each test drives one
+//! arrival order directly.
 
 use std::sync::Arc;
 use std::time::Duration;

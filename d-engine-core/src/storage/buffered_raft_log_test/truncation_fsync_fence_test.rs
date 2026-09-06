@@ -61,8 +61,8 @@ async fn test_durable_index_does_not_adopt_a_stale_fsync_after_truncation() {
     let raft_log = raft_log.start(receiver, None);
     std::thread::sleep(Duration::from_millis(10)); // ensure IO thread is ready
 
-    // Old leader (term=1) replicates entries 1..=10. append_entries() persists
-    // them synchronously; write_notify then wakes the IO thread, which
+    // Old leader (term=1) replicates entries 1..=10. append_entries() inserts
+    // them into memory and notifies the IO thread, which persists the range and
     // dispatches a physical fsync for "up to index=10" — that fsync is now
     // running in the background, blocked on flush_gate.
     let entries: Vec<Entry> = (1..=10).map(|i| entry(i, 1)).collect();

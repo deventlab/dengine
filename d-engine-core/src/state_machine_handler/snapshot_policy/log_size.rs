@@ -4,7 +4,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-
+use tracing::error;
 use tracing::trace;
 use tracing::warn;
 
@@ -39,12 +39,28 @@ impl SnapshotPolicy for LogSizePolicy {
         let lag = self.calculate_lag(ctx);
         let threshold = self.threshold.load(Ordering::Relaxed);
 
-        if threshold > 0 && lag >= threshold.saturating_mul(10) {
-            warn!(
-                lag,
-                threshold,
-                "Log lag exceeds 10x snapshot threshold — snapshots may not be keeping up"
-            );
+        metrics::gauge!("core.raft.snapshot.log_lag").set(lag as f64);
+
+        // The in-memory Raft log grows until a snapshot purges it. If snapshot
+        // creation can't keep up with the write rate this climbs unbounded and
+        // eventually OOMs the node — make it loud well before that.
+        if threshold > 0 {
+            if lag >= threshold.saturating_mul(50) {
+                error!(
+                    lag,
+                    threshold,
+                    "Raft log lag is 50x the snapshot threshold — snapshot creation is \
+                    NOT keeping up with writes; the in-memory log is growing unbounded \
+                    and will OOM this node. Check snapshot/apply throughput."
+                );
+            } else if lag >= threshold.saturating_mul(10) {
+                warn!(
+                    lag,
+                    threshold,
+                    "Raft log lag exceeds 10x the snapshot threshold — snapshots may \
+                            not be keeping up"
+                );
+            }
         }
 
         let should_trigger = lag >= threshold;
