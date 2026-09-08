@@ -475,7 +475,10 @@ where
                 let _ = self.role.drain_read_buffer();
 
                 debug!("BecomeFollower");
-                self.role = self.role.become_follower()?;
+                let mut new_role = self.role.become_follower()?;
+                let withheld_acks = self.role.take_pending_acks();
+                new_role.restore_pending_acks(withheld_acks);
+                self.role = new_role;
 
                 // Reset vote when stepping down (new term, no vote yet)
                 self.role.state_mut().commit_vote_reset(&self.ctx)?;
@@ -494,7 +497,10 @@ where
                 let _ = self.role.drain_read_buffer();
 
                 debug!("BecomeCandidate");
-                self.role = self.role.become_candidate()?;
+                let mut new_role = self.role.become_candidate()?;
+                let withheld_acks = self.role.take_pending_acks();
+                new_role.restore_pending_acks(withheld_acks);
+                self.role = new_role;
 
                 // No leader during candidate state
                 let current_term = self.role.current_term();
@@ -505,7 +511,10 @@ where
             }
             InternalEvent::BecomeLeader => {
                 debug!("BecomeLeader");
-                self.role = self.role.become_leader()?;
+                let mut new_role = self.role.become_leader()?;
+                let withheld_acks = self.role.take_pending_acks();
+                new_role.restore_pending_acks(withheld_acks);
+                self.role = new_role;
 
                 // Mark vote as committed (candidate → leader transition)
                 let current_term = self.role.current_term();
@@ -551,7 +560,10 @@ where
                 let _ = self.role.drain_read_buffer();
 
                 debug!("BecomeLearner");
-                self.role = self.role.become_learner()?;
+                let mut new_role = self.role.become_learner()?;
+                let withheld_acks = self.role.take_pending_acks();
+                new_role.restore_pending_acks(withheld_acks);
+                self.role = new_role;
 
                 // Learner has no leader initially
                 let current_term = self.role.current_term();

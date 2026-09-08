@@ -2892,13 +2892,15 @@ async fn test_follower_rejects_strong_consistency_reads() {
 }
 
 // ============================================================================
-// MemFirst ACK Tests
+// Withheld-ACK tests (RPO=0, #446)
+//
+// End-to-end coverage of the AppendEntries workflow deciding to withhold or send.
+// The queue mechanics (release / reject / carry across a role transition) are
+// unit-tested in `pending_ack_test.rs`.
 // ============================================================================
 
-/// Follower withholds the AppendEntries ACK until its own durable_index catches up.
-///
-/// RPO=0 (#446): an ACK asserts durability, so it must not go out before the
-/// claimed index is fsynced. LogFlushed releases the withheld response.
+/// The workflow withholds a success ACK while durable_index is behind the claimed
+/// index, and releases it once `handle_log_flushed` reports that index durable.
 #[tokio::test]
 async fn test_follower_withholds_ack_until_durable() {
     let (_graceful_tx, graceful_rx) = watch::channel(());
@@ -2959,90 +2961,6 @@ async fn test_follower_withholds_ack_until_durable() {
 
     let response = resp_rx.try_recv().expect("ACK must be released once durable").unwrap();
     assert!(response.is_success());
-}
-
-/// #446: if `FollowerState` is dropped (role transition — e.g. a higher-term
-/// AppendEntries or becoming a candidate) while it still holds a withheld ACK, the
-/// pending sender must be dropped with it — the caller waiting on `resp_rx` must see
-/// the channel close, not hang forever and not receive a stale success.
-///
-/// This is the actual mechanism #446's design relies on for role-transition safety
-/// (see the design doc / ADR-042 discussion): a real role transition replaces
-/// `self.role` wholesale, which drops the old `FollowerState` — including
-/// `pending_append_acks` and every sender inside it. This test drops the struct
-/// directly rather than driving a full role-transition workflow, because that's
-/// exactly what a role transition does to it; nothing here relies on any other part
-/// of the transition machinery.
-#[tokio::test]
-async fn test_dropping_follower_state_releases_pending_ack_senders_as_closed() {
-    let (_graceful_tx, graceful_rx) = watch::channel(());
-    let (mut context, _temp_dir) = mock_raft_context_with_temp(graceful_rx, None);
-
-    let leader_term = 2u64;
-    let appended_index = 5u64;
-
-    let mut replication_handler = MockReplicationCore::new();
-    replication_handler.expect_handle_append_entries().returning(move |_, _, _| {
-        Ok(AppendResponseWithUpdates {
-            response: AppendEntriesResponse::success(
-                1,
-                leader_term,
-                Some(LogId {
-                    term: leader_term,
-                    index: appended_index,
-                }),
-            ),
-            commit_index_update: None,
-        })
-    });
-    context.handlers.replication_handler = replication_handler;
-    context.membership = Arc::new(MockMembership::new());
-
-    let mut state =
-        FollowerState::<MockTypeConfig>::new(1, context.node_config.clone(), None, None);
-    state.shared_state_mut().update_current_term(leader_term);
-
-    let append_request = AppendEntriesRequest {
-        term: leader_term,
-        leader_id: 2,
-        prev_log_index: 0,
-        prev_log_term: 0,
-        entries: vec![],
-        leader_commit_index: 0,
-    };
-    let (resp_tx, mut resp_rx) = MaybeCloneOneshot::new();
-    let inbound_event = InboundEvent::AppendEntries(append_request, vec![resp_tx]);
-    let (internal_event_tx, _internal_event_rx) = mpsc::unbounded_channel();
-
-    assert!(
-        state
-            .handle_inbound_event(inbound_event, &context, internal_event_tx)
-            .await
-            .is_ok()
-    );
-
-    // Confirm the ACK is genuinely withheld (durable_index hasn't caught up) before
-    // dropping — otherwise this test wouldn't be exercising the pending-ack path at all.
-    assert!(
-        resp_rx.try_recv().is_err(),
-        "precondition: the ACK must still be withheld before the role transition"
-    );
-
-    // Simulates a real role transition: `self.role = self.role.become_xxx()?` drops
-    // the old FollowerState (and everything it owns) the same way this explicit
-    // drop does.
-    drop(state);
-
-    // The withheld ACK's sender is gone — resp_rx must observe the channel closing,
-    // not hang forever and not receive a stale success response.
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), resp_rx.recv())
-        .await
-        .expect("recv() must resolve promptly once the sender is dropped, not hang");
-    assert!(
-        result.is_err(),
-        "dropping FollowerState must close the pending ACK's channel, not deliver a \
-         stale response"
-    );
 }
 
 /// #446: two independent AppendEntries requests (e.g. a leader retry) that both claim
@@ -3134,119 +3052,6 @@ async fn test_multiple_requests_at_same_threshold_all_receive_response() {
         .unwrap();
     assert!(response1.is_success());
     assert!(response2.is_success());
-}
-
-/// #446: `LogFlushed` must release exactly the pending ACKs whose threshold is `<=`
-/// durable_index — not `<` (off-by-one), and not all-or-nothing.
-#[tokio::test]
-async fn test_log_flushed_releases_only_thresholds_at_or_below_durable() {
-    let (_graceful_tx, graceful_rx) = watch::channel(());
-    let (mut context, _temp_dir) = mock_raft_context_with_temp(graceful_rx, None);
-
-    let leader_term = 2u64;
-    let call_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let call_count_clone = call_count.clone();
-
-    let mut replication_handler = MockReplicationCore::new();
-    replication_handler
-        .expect_handle_append_entries()
-        .times(3)
-        .returning(move |_, _, _| {
-            let claimed = match call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                0 => 10,
-                1 => 12,
-                _ => 15,
-            };
-            Ok(AppendResponseWithUpdates {
-                response: AppendEntriesResponse::success(
-                    1,
-                    leader_term,
-                    Some(LogId {
-                        term: leader_term,
-                        index: claimed,
-                    }),
-                ),
-                commit_index_update: None,
-            })
-        });
-    context.handlers.replication_handler = replication_handler;
-    context.membership = Arc::new(MockMembership::new());
-
-    let mut state =
-        FollowerState::<MockTypeConfig>::new(1, context.node_config.clone(), None, None);
-    state.shared_state_mut().update_current_term(leader_term);
-
-    let base_request = AppendEntriesRequest {
-        term: leader_term,
-        leader_id: 2,
-        prev_log_index: 0,
-        prev_log_term: 0,
-        entries: vec![],
-        leader_commit_index: 0,
-    };
-    let (internal_event_tx, _internal_event_rx) = mpsc::unbounded_channel();
-
-    let (tx10, mut rx10) = MaybeCloneOneshot::new();
-    state
-        .handle_inbound_event(
-            InboundEvent::AppendEntries(base_request.clone(), vec![tx10]),
-            &context,
-            internal_event_tx.clone(),
-        )
-        .await
-        .unwrap();
-    let (tx12, mut rx12) = MaybeCloneOneshot::new();
-    state
-        .handle_inbound_event(
-            InboundEvent::AppendEntries(base_request.clone(), vec![tx12]),
-            &context,
-            internal_event_tx.clone(),
-        )
-        .await
-        .unwrap();
-    let (tx15, mut rx15) = MaybeCloneOneshot::new();
-    state
-        .handle_inbound_event(
-            InboundEvent::AppendEntries(base_request, vec![tx15]),
-            &context,
-            internal_event_tx,
-        )
-        .await
-        .unwrap();
-
-    assert!(rx10.try_recv().is_err());
-    assert!(rx12.try_recv().is_err());
-    assert!(rx15.try_recv().is_err());
-
-    let (flush_tx, _flush_rx) = mpsc::unbounded_channel();
-
-    // durable_index advances to 12 — releases 10 and 12 (boundary is <=, not <), 15 stays.
-    state.handle_log_flushed(12, &context, &flush_tx).await;
-    assert!(
-        rx10.try_recv()
-            .expect("threshold 10 <= durable 12, must be released")
-            .unwrap()
-            .is_success()
-    );
-    assert!(
-        rx12.try_recv()
-            .expect("threshold 12 <= durable 12 (boundary case), must be released")
-            .unwrap()
-            .is_success()
-    );
-    assert!(
-        rx15.try_recv().is_err(),
-        "threshold 15 > durable 12, must still be withheld"
-    );
-
-    // durable_index advances to 15 — releases the rest.
-    state.handle_log_flushed(15, &context, &flush_tx).await;
-    assert!(
-        rx15.try_recv()
-            .expect("threshold 15 <= durable 15, must now be released")
-            .unwrap()
-            .is_success()
-    );
 }
 
 /// Follower sends ACK immediately for heartbeat (no entries).
