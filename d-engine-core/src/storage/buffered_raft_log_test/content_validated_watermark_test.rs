@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use d_engine_proto::common::Entry;
+use d_engine_proto::common::LogId;
 
 use crate::storage::raft_log::RaftLog;
 use crate::test_utils::BufferedRaftLogTestContext;
@@ -66,7 +67,10 @@ async fn test_stale_durable_report_rejected_when_term_no_longer_matches() {
     raft_log.filter_out_conflicts_and_append(80, 1, term2_tail).await.unwrap();
 
     // The stale in-flight fsync's report, generated before the truncation.
-    let result = raft_log.try_advance_durable_index(100, 1);
+    let result = raft_log.try_advance_durable_index(LogId {
+        term: 1,
+        index: 100,
+    });
 
     assert_eq!(
         result, None,
@@ -89,7 +93,10 @@ async fn test_durable_report_accepted_when_term_still_matches() {
     let entries: Vec<Entry> = (1..=100).map(|i| entry(i, 1)).collect();
     raft_log.append_entries(entries).await.unwrap();
 
-    let result = raft_log.try_advance_durable_index(100, 1);
+    let result = raft_log.try_advance_durable_index(LogId {
+        term: 1,
+        index: 100,
+    });
 
     assert_eq!(
         result,
@@ -113,7 +120,10 @@ async fn test_durable_report_then_truncation_is_order_independent() {
 
     // Report arrives first, while the log is still all term 1 — legitimately
     // applied at this point in time.
-    let result = raft_log.try_advance_durable_index(100, 1);
+    let result = raft_log.try_advance_durable_index(LogId {
+        term: 1,
+        index: 100,
+    });
     assert_eq!(result, Some(100));
     assert_eq!(raft_log.durable_index(), 100);
 

@@ -31,15 +31,29 @@ mod start_data_dir_tests {
     }
 
     /// Opening an existing data directory is idempotent (data is preserved).
+    ///
+    /// Uses `start_with` + a timeout-only config so the client's write deadline
+    /// is not the 50ms `general_raft_timeout_duration_in_ms` default: since
+    /// #446 a `put` ack waits for a physical fdatasync, which under a loaded
+    /// test suite (many parallel RocksDB instances) can exceed 50ms. The
+    /// config's `data_dir` is still ignored — the explicit arg wins — so this
+    /// keeps testing exactly the reopen/data-preservation path.
     #[tokio::test]
     #[serial]
     async fn test_start_existing_directory_is_idempotent() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let data_dir = temp_dir.path().join("db");
+        let config_path = temp_dir.path().join("d-engine.toml");
+        std::fs::write(
+            &config_path,
+            "[raft]\ngeneral_raft_timeout_duration_in_ms = 3000\n",
+        )
+        .expect("write config");
 
         // First start: write a key
         {
-            let engine = EmbeddedEngine::start(&data_dir).await.expect("first start");
+            let engine =
+                EmbeddedEngine::start_with(&data_dir, &config_path).await.expect("first start");
             engine.wait_ready(std::time::Duration::from_secs(5)).await.expect("ready");
             engine.client().put(b"k".to_vec(), b"v".to_vec()).await.expect("put");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -48,7 +62,8 @@ mod start_data_dir_tests {
 
         // Second start: data must still be there
         {
-            let engine = EmbeddedEngine::start(&data_dir).await.expect("second start");
+            let engine =
+                EmbeddedEngine::start_with(&data_dir, &config_path).await.expect("second start");
             engine.wait_ready(std::time::Duration::from_secs(5)).await.expect("ready");
             let val = engine.client().get_linearizable(b"k".to_vec()).await.expect("get");
             assert_eq!(val.as_deref(), Some(b"v".as_ref()), "data must persist");

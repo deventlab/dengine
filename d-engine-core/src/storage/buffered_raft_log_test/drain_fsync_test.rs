@@ -1196,14 +1196,9 @@ async fn test_persist_scan_tracks_frontier_not_stuck_durable_index() {
     log_store.expect_load_purge_boundary().returning(|| Ok(None));
     log_store.expect_reset().returning(|| Ok(()));
     log_store.expect_truncate().returning(|_| Ok(()));
-    log_store
-        .expect_replace_range()
-        .returning(|from, new_entries| {
-            Ok(new_entries
-                .last()
-                .map(|e| e.index)
-                .unwrap_or(from.saturating_sub(1)))
-        });
+    log_store.expect_replace_range().returning(|from, new_entries| {
+        Ok(new_entries.last().map(|e| e.index).unwrap_or(from.saturating_sub(1)))
+    });
     log_store.expect_is_write_durable().returning(|| false);
     log_store.expect_flush().returning(|| Ok(()));
     log_store.expect_flush_async().returning(|| Ok(()));
@@ -1284,10 +1279,7 @@ async fn test_cold_start_persist_frontier_starts_past_durable_index() {
     {
         let calls = persist_calls.clone();
         log_store.expect_persist_entries().returning(move |entries| {
-            calls
-                .lock()
-                .unwrap()
-                .push(entries.iter().map(|e| e.index).collect());
+            calls.lock().unwrap().push(entries.iter().map(|e| e.index).collect());
             Ok(())
         });
     }
@@ -1296,9 +1288,9 @@ async fn test_cold_start_persist_frontier_starts_past_durable_index() {
     log_store.expect_load_purge_boundary().returning(|| Ok(None));
     log_store.expect_reset().returning(|| Ok(()));
     log_store.expect_truncate().returning(|_| Ok(()));
-    log_store.expect_replace_range().returning(|from, e| {
-        Ok(e.last().map(|x| x.index).unwrap_or(from.saturating_sub(1)))
-    });
+    log_store
+        .expect_replace_range()
+        .returning(|from, e| Ok(e.last().map(|x| x.index).unwrap_or(from.saturating_sub(1))));
     log_store.expect_is_write_durable().returning(|| false);
     log_store.expect_flush().returning(|| Ok(()));
     log_store.expect_flush_async().returning(|| Ok(()));
@@ -1365,9 +1357,7 @@ async fn test_flush_turn_catch_up_persists_writes_coalesced_during_the_turn() {
     let mut log_store = MockLogStore::new();
     log_store.expect_last_index().returning(|| 0);
     log_store.expect_persist_entries().returning(move |entries| {
-        entered_tx
-            .send(entries.iter().map(|e| e.index).collect())
-            .ok();
+        entered_tx.send(entries.iter().map(|e| e.index).collect()).ok();
         release_rx.lock().unwrap().recv().ok();
         Ok(())
     });
@@ -1377,9 +1367,9 @@ async fn test_flush_turn_catch_up_persists_writes_coalesced_during_the_turn() {
     log_store.expect_load_purge_boundary().returning(|| Ok(None));
     log_store.expect_reset().returning(|| Ok(()));
     log_store.expect_truncate().returning(|_| Ok(()));
-    log_store.expect_replace_range().returning(|from, e| {
-        Ok(e.last().map(|x| x.index).unwrap_or(from.saturating_sub(1)))
-    });
+    log_store
+        .expect_replace_range()
+        .returning(|from, e| Ok(e.last().map(|x| x.index).unwrap_or(from.saturating_sub(1))));
     log_store.expect_is_write_durable().returning(|| false);
     log_store.expect_flush().returning(|| Ok(()));
     log_store.expect_flush_async().returning(|| Ok(()));
@@ -1452,8 +1442,8 @@ async fn test_flush_turn_catch_up_persists_writes_coalesced_during_the_turn() {
 
     flush_task.await.unwrap().unwrap();
     while let Ok(ev) = log_flush_rx.try_recv() {
-        if let crate::InternalEvent::FsyncCompleted { index, term } = ev {
-            raft_log.try_advance_durable_index(index, term);
+        if let crate::InternalEvent::FsyncCompleted(mark) = ev {
+            raft_log.try_advance_durable_index(mark);
         }
     }
     assert_eq!(

@@ -259,8 +259,8 @@ pub fn drain_and_apply_fsync_completions(
     log_flush_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::InternalEvent>,
 ) {
     while let Ok(event) = log_flush_rx.try_recv() {
-        if let crate::InternalEvent::FsyncCompleted { index, term } = event {
-            raft_log.try_advance_durable_index(index, term);
+        if let crate::InternalEvent::FsyncCompleted(mark) = event {
+            raft_log.try_advance_durable_index(mark);
         }
     }
 }

@@ -33,15 +33,15 @@
 //! ## How `durable_index` advances (#446 single-owner)
 //!
 //! The blocking fsync task does **not** write `durable_index`. On completion it
-//! calls `notify_fsync_completed(index, term)`, sending
-//! `InternalEvent::FsyncCompleted { index, term }` to `raft.rs`'s event loop —
-//! the sole owner of `durable_index`. That loop calls
-//! `try_advance_durable_index(index, term)`, which content-validates the report
-//! (`entry_term(index) == Some(term)`) and clamps to `memory_max_index` before
-//! `fetch_max`. A stale report — for entries a concurrent truncation already
-//! discarded — is rejected. `FsyncCoordinator`'s `generation` fence
-//! (`fence_truncation` / `fence_reset`) is the first line of defence: a fsync
-//! round whose generation changed mid-flight never sends its completion at all.
+//! calls `notify_fsync_completed(mark)`, sending `InternalEvent::FsyncCompleted(LogId)` to `raft.rs`'s
+//! event loop — the sole owner of `durable_index`. That loop calls
+//! `try_advance_durable_index(mark)`, which rejects the report if
+//! `entry_term(mark.index) != Some(mark.term)` and clamps to `memory_max_index`
+//! before `fetch_max`. Upstream, `FsyncCoordinator` keeps `pending_max` as a
+//! term-first `(term, index)`: a newer term's mark always wins, so a stale
+//! pre-truncation submit can never swallow the valid post-truncation one. A
+//! `generation` bump (`bump_generation` / `fence_reset`) additionally fences a
+//! round whose log was truncated or reset mid-flight.
 //!
 //! ## Fsync triggers
 //!
@@ -686,15 +686,13 @@ where
         // Purged entries are backed by the snapshot; treat cutoff as durable.
         // Already running on the single owner (called from role_state.rs, same
         // thread as remove_range) — safe to apply directly, no message hop needed.
-        if let Some(new_durable) =
-            self.try_advance_durable_index(cutoff_index.index, cutoff_index.term)
+        if let Some(new_durable) = self.try_advance_durable_index(cutoff_index)
             && let Some(ref tx) = self.log_flush_tx
         {
             let _ = tx.send(crate::InternalEvent::LogFlushed {
                 durable_index: new_durable,
             });
         }
-
         // Route purge through the IO thread so it never blocks the inbound event loop.
         // Also writes the purge boundary to META_CF in the RocksDB implementation.
         let (done_tx, done_rx) = oneshot::channel();
@@ -713,17 +711,16 @@ where
 
     fn try_advance_durable_index(
         &self,
-        index: u64,
-        term: u64,
+        mark: LogId,
     ) -> Option<u64> {
         let prev = self.durable_index.load(Ordering::Acquire);
-        if index <= prev {
+        if mark.index <= prev {
             return None;
         }
-        if self.entry_term(index) != Some(term) {
+        if self.entry_term(mark.index) != Some(mark.term) {
             return None;
         }
-        let safe = index.min(
+        let safe = mark.index.min(
             self.memory_max_index
                 .load(Ordering::Acquire)
                 .max(self.last_purged_index.load(Ordering::Acquire)),
@@ -989,9 +986,6 @@ where
             tokio::time::interval_at(start, Duration::from_millis(idle_flush_interval_ms));
         safety_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Highest index in OS page cache, awaiting fsync. Reset to 0 after each fsync.
-        let mut pending_max: u64 = 0;
-
         // Highest log index the IO thread has written to the OS page cache —
         // B-local, the "submitted" watermark sitting between `memory_max_index`
         // and `durable_index`
@@ -1002,10 +996,10 @@ where
                 cmd = receiver.recv() => {
                     let Some(cmd) = cmd else { break };
                     let should_break = match cmd {
-                        IOTask::Shutdown => Self::run_flush_turn(&this, &mut receiver, &mut persisted_index, &mut pending_max, Vec::new(), true).await,
-                        IOTask::Flush(reply) => Self::run_flush_turn(&this, &mut receiver, &mut persisted_index, &mut pending_max, vec![reply], false).await,
+                        IOTask::Shutdown => Self::run_flush_turn(&this, &mut receiver, &mut persisted_index,Vec::new(), true).await,
+                        IOTask::Flush(reply) => Self::run_flush_turn(&this, &mut receiver, &mut persisted_index, vec![reply], false).await,
                         cmd => {
-                            if Self::run_storage_tasks(cmd, &this, &mut persisted_index, &mut pending_max).await {
+                            if Self::run_storage_tasks(cmd, &this, &mut persisted_index).await {
                                 break;
                             }
                             continue;
@@ -1016,11 +1010,11 @@ where
                 _ = safety_timer.tick() => {
                     let from = this.durable_index.load(Ordering::Acquire) + 1;
                     let end = this.memory_max_index.load(Ordering::Acquire);
-                    if let Ok(Some(persisted_to)) =
+                    if let Ok(Some(mark)) =
                         Self::persist_pending_range(&this, from, end, "safety-net").await
                     {
-                        persisted_index = persisted_index.max(persisted_to);
-                        this.fsync_coordinator.submit(&this, persisted_to, vec![]);
+                        persisted_index = persisted_index.max(mark.index);
+                        this.fsync_coordinator.submit(&this, mark, vec![]);
                     }
                 }
             }
@@ -1036,16 +1030,16 @@ where
     /// between the caller's `memory_max_index` read and this scan, those
     /// indices are simply absent and never written.
     ///
-    /// Returns `Some(highest index actually written)` — which may be *below*
-    /// `to` in that truncation-race case — or `None` when the scan found
-    /// nothing. Callers advance their own `persisted_index` / fsync target
-    /// from this value, so neither ever points past a real entry.
+    /// Returns `Some((term, index))` of the last entry written — its index may
+    /// be *below* `to` in that truncation-race case — or `None` when the scan
+    /// found nothing. Callers advance `persisted_index` and submit this mark to
+    /// the fsync coordinator, so neither points past a real entry.
     async fn persist_pending_range(
         this: &Arc<Self>,
         from: u64,
         to: u64,
         ctx: &str,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<LogId>> {
         if this.is_poisoned() {
             return Err(Error::Fatal("raft log storage is poisoned".to_string()));
         }
@@ -1053,7 +1047,10 @@ where
             return Ok(None);
         }
         let entries = this.get_entries_range(from..=to)?;
-        let Some(highest_written) = entries.last().map(|e| e.index) else {
+        let Some(mark) = entries.last().map(|e| LogId {
+            term: e.term,
+            index: e.index,
+        }) else {
             return Ok(None);
         };
         this.log_store.persist_entries(entries).await.inspect_err(|e| {
@@ -1063,23 +1060,28 @@ where
             );
             this.mark_poisoned_and_notify(format!("{ctx}: persist_entries failed: {e:?}"));
         })?;
-        Ok(Some(highest_written))
+        Ok(Some(mark))
     }
 
     async fn run_flush_turn(
         this: &Arc<Self>,
         receiver: &mut mpsc::UnboundedReceiver<IOTask>,
         persisted_index: &mut u64,
-        pending_max: &mut u64,
         mut replies: Vec<oneshot::Sender<Result<()>>>,
         mut seen_shutdown: bool,
     ) -> bool {
+        // Highest (term, index) this turn persisted. Delivered with `replies` in
+        // one submit at the end. Any drained ReplaceRange/Persist submits its own
+        // mark directly; term-first ordering in the coordinator means a stale
+        // leading mark here loses to a newer-term drained one.
+        let mut mark = LogId::default();
+
         let end = this.memory_max_index.load(Ordering::Acquire);
         let mut persist_failed = false;
         match Self::persist_pending_range(this, *persisted_index + 1, end, "flush-turn").await {
-            Ok(Some(persisted_to)) => {
-                *persisted_index = persisted_to;
-                *pending_max = (*pending_max).max(persisted_to);
+            Ok(Some(m)) => {
+                *persisted_index = m.index;
+                mark = m;
             }
             Ok(None) => {}
             Err(e) => {
@@ -1090,23 +1092,16 @@ where
             }
         }
 
-        // `seen_shutdown` is not a gate here — regardless of whether the
-        // caller already knows shutdown is happening, any commands still
-        // queued must be drained and replied to. Whether to drain the queue
-        // and whether to eventually break the loop are separate concerns
-        // and must not share one flag.
+        // `seen_shutdown` is not a gate here — any queued commands must still be
+        // drained and replied to.
         while let Ok(cmd) = receiver.try_recv() {
             match cmd {
-                IOTask::Shutdown => {
-                    seen_shutdown = true;
-                }
+                IOTask::Shutdown => seen_shutdown = true,
                 IOTask::Flush(reply) => replies.push(reply),
-                // A coalesced write. Drop it — the unconditional tail re-scan
-                // below persists everything up to `memory_max_index`, and this
-                // turn ends with a single fsync submit.
+                // Coalesced write — the unconditional catch-up below covers it.
                 IOTask::Persist => {}
                 cmd => {
-                    if Self::run_storage_tasks(cmd, this, persisted_index, pending_max).await {
+                    if Self::run_storage_tasks(cmd, this, persisted_index).await {
                         for reply in replies {
                             let _ = reply
                                 .send(Err(Error::Fatal("fatal IO error, batch aborted".into())));
@@ -1117,24 +1112,21 @@ where
             }
         }
 
-        // Tail re-scan: a discarded `Persist` or a drained command may have moved
-        // memory_max_index past the leading persist. Unconditional since #446 —
-        // for a coalesced write the discarded `Persist` was its only signal; a
-        // Flush reply / final Shutdown drain also need everything up to now.
+        // Catch-up: a dropped Persist or a drained command may have moved
+        // memory_max_index past the leading persist.
         if !persist_failed {
             let end = this.memory_max_index.load(Ordering::Acquire);
-            if let Ok(Some(persisted_to)) =
+            if let Ok(Some(m)) =
                 Self::persist_pending_range(this, *persisted_index + 1, end, "flush-turn catch-up")
                     .await
             {
-                *persisted_index = persisted_to;
-                *pending_max = (*pending_max).max(persisted_to);
+                *persisted_index = m.index;
+                mark = m;
             }
         }
 
-        this.fsync_coordinator.submit(this, *pending_max, replies);
+        this.fsync_coordinator.submit(this, mark, replies);
 
-        *pending_max = 0;
         if seen_shutdown {
             let _ = this.meta_store.flush();
         }
@@ -1160,7 +1152,6 @@ where
         cmd: IOTask,
         this: &Arc<Self>,
         persisted_index: &mut u64,
-        pending_max: &mut u64,
     ) -> bool {
         match cmd {
             IOTask::Flush(_) => {
@@ -1176,9 +1167,9 @@ where
                 let end = this.memory_max_index.load(Ordering::Acquire);
                 match Self::persist_pending_range(this, *persisted_index + 1, end, "persist").await
                 {
-                    Ok(Some(persisted_to)) => {
-                        *persisted_index = persisted_to;
-                        this.fsync_coordinator.submit(this, persisted_to, Vec::new());
+                    Ok(Some(mark)) => {
+                        *persisted_index = mark.index;
+                        this.fsync_coordinator.submit(this, mark, Vec::new());
                     }
                     Ok(None) => {}
                     Err(_) => return true, // poisoned — same exit convention as the mutations below
@@ -1198,6 +1189,8 @@ where
                     return true;
                 }
 
+                // Capture the new tail's term before `new_entries` is moved.
+                let new_tail_term = new_entries.last().map(|e| e.term).unwrap_or(0);
                 let new_tail = match this.log_store.replace_range(truncate_from, new_entries).await
                 {
                     Ok(new_tail) => new_tail,
@@ -1208,15 +1201,19 @@ where
                         return true;
                     }
                 };
-                // A real new tail was written — fsync it (fdatasync is whole-WAL,
-                // so it also covers any leading persist from this same turn;
-                // clear pending_max so the turn's final submit doesn't re-send a
-                // now-stale index).
+                // New content written — submit its (term, index). fdatasync is
+                // whole-WAL so it also covers any leading persist from this turn.
                 if new_tail >= truncate_from {
-                    this.fsync_coordinator.submit(this, new_tail, vec![]);
+                    this.fsync_coordinator.submit(
+                        this,
+                        LogId {
+                            term: new_tail_term,
+                            index: new_tail,
+                        },
+                        vec![],
+                    );
                 }
-                *pending_max = 0;
-                *persisted_index = new_tail; // == truncate_from - 1 when the new tail is empty
+                *persisted_index = new_tail;
                 let _ = done.send(Ok(()));
                 false
             }
@@ -1254,9 +1251,6 @@ where
                     // signal batch_processor to exit — disk state is corrupted
                     return true;
                 }
-
-                // disk wiped — pending page-cache watermark must be zeroed
-                *pending_max = 0;
 
                 // log wiped — next entry to persist is index 1
                 *persisted_index = 0;
@@ -1351,11 +1345,10 @@ where
     /// Called by fsync_coordinator (C) — never writes `durable_index` itself.
     pub(super) fn notify_fsync_completed(
         &self,
-        index: u64,
-        term: u64,
+        mark: LogId,
     ) {
         if let Some(ref tx) = self.log_flush_tx {
-            let _ = tx.send(crate::InternalEvent::FsyncCompleted { index, term });
+            let _ = tx.send(crate::InternalEvent::FsyncCompleted(mark));
         }
     }
 
@@ -1407,9 +1400,7 @@ where
         self.memory_max_index.store(new_max, Ordering::Release);
 
         self.durable_index.fetch_min(new_max, Ordering::AcqRel);
-        // Clamps pending_max and bumps generation, in that order — see
-        // fence_truncation()'s doc comment for why the order matters.
-        self.fsync_coordinator.fence_truncation(new_max);
+        self.fsync_coordinator.bump_generation();
         // `entries` guard drops here (end of scope) — write lock released.
     }
 

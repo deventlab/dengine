@@ -85,8 +85,7 @@ pub trait RaftLog: Send + Sync + 'static {
     /// to decide whether to fire `handle_log_flushed`.
     fn try_advance_durable_index(
         &self,
-        index: u64,
-        term: u64,
+        mark: LogId,
     ) -> Option<u64>;
 
     /// Returns the LogId (term + index) of the last entry.

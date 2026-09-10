@@ -621,10 +621,8 @@ where
                     .handle_log_flushed(durable_index, &self.ctx, &self.internal_event_tx)
                     .await;
             }
-            InternalEvent::FsyncCompleted { index, term } => {
-                if let Some(new_durable) =
-                    self.ctx.raft_log().try_advance_durable_index(index, term)
-                {
+            InternalEvent::FsyncCompleted(mark) => {
+                if let Some(new_durable) = self.ctx.raft_log().try_advance_durable_index(mark) {
                     self.role
                         .handle_log_flushed(new_durable, &self.ctx, &self.internal_event_tx)
                         .await;

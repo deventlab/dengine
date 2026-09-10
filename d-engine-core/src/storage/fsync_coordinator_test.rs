@@ -20,8 +20,10 @@ use crate::MockMetaStore;
 use crate::MockStorageEngine;
 use crate::MockTypeConfig;
 use crate::PersistenceConfig;
+use crate::RaftLog; // try_advance_durable_index is a RaftLog trait method
 use crate::Result;
 use d_engine_proto::common::Entry;
+use d_engine_proto::common::LogId;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -59,12 +61,12 @@ fn test_new_initializes_empty_state() {
         "inflight must start false"
     );
     assert_eq!(
-        coord.pending_max.load(Ordering::Acquire),
+        coord.pending_max.lock().index,
         0,
         "pending_max must start at 0"
     );
     assert!(
-        coord.pending_replies.lock().unwrap().is_empty(),
+        coord.pending_replies.lock().is_empty(),
         "pending_replies must start empty"
     );
     assert_eq!(
@@ -87,12 +89,12 @@ fn test_fence_reset_zeroes_pending_max() {
     let coord = FsyncCoordinator::new();
     // Directly seed pending_max — no need to go through submit() (which would
     // spawn a real background task and race with fence_reset() below).
-    coord.pending_max.store(10, Ordering::Release);
+    *coord.pending_max.lock() = LogId { term: 1, index: 10 };
 
     coord.fence_reset();
 
     assert_eq!(
-        coord.pending_max.load(Ordering::Acquire),
+        coord.pending_max.lock().index,
         0,
         "fence_reset() must zero pending_max"
     );
@@ -113,12 +115,12 @@ fn test_fence_reset_drains_pending_replies_with_err() {
 
     let (tx1, mut rx1) = oneshot::channel();
     let (tx2, mut rx2) = oneshot::channel();
-    coord.pending_replies.lock().unwrap().extend([tx1, tx2]);
+    coord.pending_replies.lock().extend([tx1, tx2]);
 
     coord.fence_reset();
 
     assert!(
-        coord.pending_replies.lock().unwrap().is_empty(),
+        coord.pending_replies.lock().is_empty(),
         "pending_replies must be empty after fence_reset()"
     );
     assert!(
@@ -178,13 +180,9 @@ fn test_fence_reset_is_safe_with_nothing_pending() {
         1,
         "generation must still increment even with nothing pending"
     );
-    assert_eq!(
-        coord.pending_max.load(Ordering::Acquire),
-        0,
-        "pending_max must stay 0"
-    );
+    assert_eq!(coord.pending_max.lock().index, 0, "pending_max must stay 0");
     assert!(
-        coord.pending_replies.lock().unwrap().is_empty(),
+        coord.pending_replies.lock().is_empty(),
         "pending_replies must stay empty"
     );
 }
@@ -207,11 +205,18 @@ fn test_submit_pending_max_uses_fetch_max_not_last_write() {
     // deterministic, no real concurrency needed to verify fetch_max order.
     coord.inflight.store(true, Ordering::Release);
 
-    coord.submit(&raft_log, 100, vec![]);
-    coord.submit(&raft_log, 50, vec![]);
+    coord.submit(
+        &raft_log,
+        LogId {
+            term: 1,
+            index: 100,
+        },
+        vec![],
+    );
+    coord.submit(&raft_log, LogId { term: 1, index: 50 }, vec![]);
 
     assert_eq!(
-        coord.pending_max.load(Ordering::Acquire),
+        coord.pending_max.lock().index,
         100,
         "pending_max must stay at the high-water mark (100), not regress to \
          a later, smaller submit() value (50)"
@@ -234,7 +239,7 @@ async fn test_submit_first_call_sets_inflight_true() {
     let coord = Arc::new(FsyncCoordinator::new());
     let raft_log = minimal_raft_log(storage);
 
-    coord.submit(&raft_log, 1, vec![]);
+    coord.submit(&raft_log, LogId { term: 1, index: 1 }, vec![]);
 
     assert!(
         coord.inflight.load(Ordering::Acquire),
@@ -269,15 +274,15 @@ fn test_submit_second_call_does_not_spawn_second_task_while_inflight() {
     coord.inflight.store(true, Ordering::Release);
 
     let (tx, mut rx) = oneshot::channel::<Result<()>>();
-    coord.submit(&raft_log, 1, vec![tx]);
+    coord.submit(&raft_log, LogId { term: 1, index: 1 }, vec![tx]);
 
     assert_eq!(
-        coord.pending_max.load(Ordering::Acquire),
+        coord.pending_max.lock().index,
         1,
         "submit() must still record pending_max even though it lost the CAS"
     );
     assert_eq!(
-        coord.pending_replies.lock().unwrap().len(),
+        coord.pending_replies.lock().len(),
         1,
         "submit() must still queue the reply even though it lost the CAS"
     );
@@ -370,13 +375,13 @@ fn test_run_until_caught_up_advances_durable_index_on_success() {
     raft_log.set_memory_max_index_for_test(5);
 
     coord.inflight.store(true, Ordering::Release);
-    coord.pending_max.store(5, Ordering::Release);
+    *coord.pending_max.lock() = LogId { term: 1, index: 5 };
 
     coord.run_until_caught_up(&raft_log);
 
     // Stand in for raft.rs's InternalEvent::FsyncCompleted handler.
-    while let Ok(InternalEvent::FsyncCompleted { index, term }) = log_flush_rx.try_recv() {
-        raft_log.try_advance_durable_index(index, term);
+    while let Ok(InternalEvent::FsyncCompleted(mark)) = log_flush_rx.try_recv() {
+        raft_log.try_advance_durable_index(mark);
     }
 
     assert_eq!(
@@ -402,7 +407,7 @@ fn test_run_until_caught_up_does_not_advance_durable_index_on_flush_failure() {
     let pre = raft_log.durable_index.load(Ordering::Acquire);
 
     coord.inflight.store(true, Ordering::Release);
-    coord.pending_max.store(5, Ordering::Release);
+    *coord.pending_max.lock() = LogId { term: 1, index: 5 };
 
     coord.run_until_caught_up(&raft_log);
 
@@ -429,8 +434,8 @@ fn test_run_until_caught_up_sends_err_to_replies_on_flush_failure() {
 
     let (tx, mut rx) = oneshot::channel::<Result<()>>();
     coord.inflight.store(true, Ordering::Release);
-    coord.pending_max.store(5, Ordering::Release);
-    coord.pending_replies.lock().unwrap().push(tx);
+    *coord.pending_max.lock() = LogId { term: 1, index: 5 };
+    coord.pending_replies.lock().push(tx);
 
     coord.run_until_caught_up(&raft_log);
 
@@ -475,8 +480,8 @@ fn test_run_until_caught_up_discards_stale_generation_result_without_advancing()
 
     let (tx, mut rx) = oneshot::channel::<Result<()>>();
     coord.inflight.store(true, Ordering::Release);
-    coord.pending_max.store(5, Ordering::Release);
-    coord.pending_replies.lock().unwrap().push(tx);
+    *coord.pending_max.lock() = LogId { term: 1, index: 5 };
+    coord.pending_replies.lock().push(tx);
 
     coord.run_until_caught_up(&raft_log);
 
@@ -545,15 +550,15 @@ fn test_run_until_caught_up_accepts_result_when_generation_unchanged() {
 
     let (tx, mut rx) = oneshot::channel::<Result<()>>();
     coord.inflight.store(true, Ordering::Release);
-    coord.pending_max.store(5, Ordering::Release);
-    coord.pending_replies.lock().unwrap().push(tx);
+    *coord.pending_max.lock() = LogId { term: 1, index: 5 };
+    coord.pending_replies.lock().push(tx);
 
     // Nothing fences this round while it runs — generation stays at 2.
     coord.run_until_caught_up(&raft_log);
 
     // Stand in for raft.rs's InternalEvent::FsyncCompleted handler.
-    while let Ok(InternalEvent::FsyncCompleted { index, term }) = log_flush_rx.try_recv() {
-        raft_log.try_advance_durable_index(index, term);
+    while let Ok(InternalEvent::FsyncCompleted(mark)) = log_flush_rx.try_recv() {
+        raft_log.try_advance_durable_index(mark);
     }
 
     assert_eq!(
@@ -590,8 +595,8 @@ fn test_run_until_caught_up_coalesces_queued_submits_into_one_flush() {
     let (tx1, mut rx1) = oneshot::channel::<Result<()>>();
     let (tx2, mut rx2) = oneshot::channel::<Result<()>>();
     coord.inflight.store(true, Ordering::Release);
-    coord.pending_max.store(10, Ordering::Release);
-    coord.pending_replies.lock().unwrap().extend([tx1, tx2]);
+    *coord.pending_max.lock() = LogId { term: 1, index: 10 };
+    coord.pending_replies.lock().extend([tx1, tx2]);
 
     coord.run_until_caught_up(&raft_log);
 
@@ -610,27 +615,24 @@ fn test_run_until_caught_up_coalesces_queued_submits_into_one_flush() {
     );
 }
 
-/// A single fsync round can end up covering a range whose *top* index was
-/// truncated away after being submitted (a stale pre-truncation persist),
-/// folded together with a *lower* index that is still valid. The coordinator
-/// collapses the round to one `(max_index, max_term)` pair reported as
-/// `FsyncCompleted` — if that pair is the stale top, content-validation on the
-/// drain side rejects it and the valid lower index gets **no report at all**,
-/// stranding `durable_index`.
+/// Two `submit()` calls race into the same pending round: a stale
+/// pre-truncation persist carrying `(term 1, index 10)` (its captured entries
+/// were all term 1, and index 10 has since been truncated away) and the valid
+/// post-truncation `ReplaceRange` mark `(term 2, index 2)`.
 ///
-/// Deterministic, IO-thread-free repro of the `test_stale_persist_after_
-/// truncation_does_not_advance_durable_index` failure. Post-truncation log is
-/// `[1, 2]`; `pending_max` holds the stale `10` (its entry is gone) with the
-/// valid `2` folded in. One round must still let `durable_index` reach 2.
+/// Term-first ordering must keep `(term 2, index 2)` — a newer term wins over
+/// an older term's higher index. Before this fix `pending_max` was a bare
+/// `fetch_max` on the index: `10` swallowed `2`, the round reported the stale
+/// `10`, content-validation rejected it, and `durable_index` never reached 2.
 ///
-/// RED until `FsyncCoordinator` derives the report from the truncation-aware
-/// persist frontier instead of the coalescing `pending_max` accumulator.
+/// Deterministic, IO-thread-free repro of
+/// `test_stale_persist_after_truncation_does_not_advance_durable_index`.
 #[test]
-fn test_run_until_caught_up_reports_valid_frontier_when_batch_top_is_stale() {
+fn test_submit_term_first_keeps_valid_mark_over_stale_higher_index() {
     let (storage, _flush_call_count) = MockStorageEngine::not_durable(
-        "run_until_caught_up_reports_valid_frontier_when_batch_top_is_stale".into(),
+        "submit_term_first_keeps_valid_mark_over_stale_higher_index".into(),
     );
-    let coord = FsyncCoordinator::new();
+    let coord = Arc::new(FsyncCoordinator::new());
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
@@ -644,37 +646,50 @@ fn test_run_until_caught_up_reports_valid_frontier_when_batch_top_is_stale() {
     let (log_flush_tx, mut log_flush_rx) = mpsc::unbounded_channel();
     let raft_log = raft_log.start(receiver, Some(log_flush_tx));
 
-    // Post-truncation log: entries 1..=2 only. Index 10 is gone.
+    // Post-truncation log: entry 1 (term 1) survived; entry 2 is the new
+    // leader's replacement (term 2). Index 10 is gone.
     {
-        let mut e = raft_log.entries.write();
-        for i in 1..=2 {
-            e.insert(
-                i,
-                Entry {
-                    index: i,
-                    term: 1,
-                    payload: None,
-                },
-            );
-        }
+        let e = raft_log.entries.write();
+        e.insert(
+            1,
+            Entry {
+                index: 1,
+                term: 1,
+                payload: None,
+            },
+        );
+        e.insert(
+            2,
+            Entry {
+                index: 2,
+                term: 2,
+                payload: None,
+            },
+        );
     }
     raft_log.set_memory_max_index_for_test(2);
 
-    // A stale `submit(10)` and a valid `submit(2)` folded into one round
-    // (`fetch_max(10)` then `fetch_max(2)` => 10).
+    // Pretend a round is in flight so submit() only records state.
     coord.inflight.store(true, Ordering::Release);
-    coord.pending_max.store(10, Ordering::Release);
+    coord.submit(&raft_log, LogId { term: 1, index: 10 }, vec![]); // stale
+    coord.submit(&raft_log, LogId { term: 2, index: 2 }, vec![]); // valid
+
+    assert_eq!(
+        *coord.pending_max.lock(),
+        LogId { term: 2, index: 2 },
+        "term-first: the newer-term mark must win over the stale higher index"
+    );
 
     coord.run_until_caught_up(&raft_log);
 
-    while let Ok(InternalEvent::FsyncCompleted { index, term }) = log_flush_rx.try_recv() {
-        raft_log.try_advance_durable_index(index, term);
+    while let Ok(InternalEvent::FsyncCompleted(mark)) = log_flush_rx.try_recv() {
+        raft_log.try_advance_durable_index(mark);
     }
 
     assert_eq!(
         raft_log.durable_index.load(Ordering::Acquire),
         2,
-        "the fsync covered index 2 (valid) and index 10 (truncated); durable_index \
-         must still reach 2 — a stale batch top must not swallow the valid frontier"
+        "durable_index must reach the valid post-truncation tail (2), not stall \
+         because a stale batch top swallowed it"
     );
 }

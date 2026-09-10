@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use d_engine_proto::common::Entry;
+use d_engine_proto::common::LogId;
 
 use crate::storage::raft_log::RaftLog;
 use crate::test_utils::BufferedRaftLogTestContext;
@@ -146,8 +147,8 @@ async fn test_stale_persist_after_truncation_does_not_advance_durable_index() {
 
     // Drain fsync completions the way raft.rs's event loop would.
     while let Ok(event) = log_flush_rx.try_recv() {
-        if let crate::InternalEvent::FsyncCompleted { index, term } = event {
-            raft_log.try_advance_durable_index(index, term);
+        if let crate::InternalEvent::FsyncCompleted(mark) = event {
+            raft_log.try_advance_durable_index(mark);
         }
     }
 
@@ -193,19 +194,14 @@ async fn test_persist_pending_range_reports_written_max_not_scan_bound() {
     );
     let raft_log = Arc::new(raft_log);
 
-    raft_log
-        .append_entries((1..=7).map(|i| entry(i, 1)).collect())
-        .await
-        .unwrap();
+    raft_log.append_entries((1..=7).map(|i| entry(i, 1)).collect()).await.unwrap();
 
     // Scan bound is 10 (stale latch); the SkipMap holds only 1..=7.
-    let written = BufferedRaftLog::persist_pending_range(&raft_log, 5, 10, "test")
-        .await
-        .unwrap();
+    let written = BufferedRaftLog::persist_pending_range(&raft_log, 5, 10, "test").await.unwrap();
 
     assert_eq!(
         written,
-        Some(7),
+        Some(LogId { term: 1, index: 7 }),
         "must report the highest index actually written (7), not the scan bound (10)"
     );
 }
@@ -229,21 +225,13 @@ async fn test_persist_frontier_skips_new_tail_after_truncation() {
     {
         let calls = persist_calls.clone();
         log_store.expect_persist_entries().returning(move |entries| {
-            calls
-                .lock()
-                .unwrap()
-                .push(entries.iter().map(|e| e.index).collect());
+            calls.lock().unwrap().push(entries.iter().map(|e| e.index).collect());
             Ok(())
         });
     }
-    log_store
-        .expect_replace_range()
-        .returning(|from, new_entries| {
-            Ok(new_entries
-                .last()
-                .map(|e| e.index)
-                .unwrap_or(from.saturating_sub(1)))
-        });
+    log_store.expect_replace_range().returning(|from, new_entries| {
+        Ok(new_entries.last().map(|e| e.index).unwrap_or(from.saturating_sub(1)))
+    });
     log_store.expect_truncate().returning(|_| Ok(()));
     log_store.expect_entry().returning(|_| Ok(None));
     log_store.expect_get_entries().returning(|_| Ok(vec![]));
@@ -275,10 +263,7 @@ async fn test_persist_frontier_skips_new_tail_after_truncation() {
     std::thread::sleep(Duration::from_millis(10));
 
     // Old leader (term 1): entries 1..=10, persisted.
-    raft_log
-        .append_entries((1..=10).map(|i| entry(i, 1)).collect())
-        .await
-        .unwrap();
+    raft_log.append_entries((1..=10).map(|i| entry(i, 1)).collect()).await.unwrap();
     raft_log.flush().await.unwrap();
 
     // New leader (term 2): conflict at index 6 → truncate [6..], replace with
@@ -294,10 +279,7 @@ async fn test_persist_frontier_skips_new_tail_after_truncation() {
     persist_calls.lock().unwrap().clear();
 
     // Next write extends the log. Its persist scan must start at 8, not 7.
-    raft_log
-        .append_entries((8..=10).map(|i| entry(i, 2)).collect())
-        .await
-        .unwrap();
+    raft_log.append_entries((8..=10).map(|i| entry(i, 2)).collect()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let calls = persist_calls.lock().unwrap().clone();

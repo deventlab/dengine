@@ -11,6 +11,7 @@ use crate::{
     BufferedRaftLog, FlushPolicy, MockStorageEngine, MockTypeConfig, PersistenceConfig, RaftLog,
 };
 use d_engine_proto::common::Entry;
+use d_engine_proto::common::LogId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -337,8 +338,14 @@ async fn test_durable_index_monotonic_when_fsyncs_complete_out_of_order() {
 
     // Simulates a fsync task completing with index 150, then a second, older
     // fsync task (dispatched earlier, finishing later) completing with 100.
-    let result_150 = raft_log.try_advance_durable_index(150, 1);
-    let result_100 = raft_log.try_advance_durable_index(100, 1);
+    let result_150 = raft_log.try_advance_durable_index(LogId {
+        term: 1,
+        index: 150,
+    });
+    let result_100 = raft_log.try_advance_durable_index(LogId {
+        term: 1,
+        index: 100,
+    });
 
     assert_eq!(
         result_150,
