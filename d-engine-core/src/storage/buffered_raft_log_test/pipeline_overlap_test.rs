@@ -13,12 +13,11 @@ use d_engine_proto::common::Entry;
 use crate::test_utils::BufferedRaftLogTestContext;
 use crate::{
     BufferedRaftLog, FlushPolicy, MockLogStore, MockMetaStore, MockStorageEngine, MockTypeConfig,
-    PersistenceConfig, PersistenceStrategy, RaftLog,
+    PersistenceConfig, RaftLog,
 };
 
 fn ctx(name: &str) -> BufferedRaftLogTestContext {
     BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 50,
         },
@@ -438,9 +437,9 @@ async fn test_io_task_replace_range_delegates_to_replace_range_not_truncate() {
 
     // replace_range() must be called exactly once for one conflict resolution
     let rr_counter = replace_range_count.clone();
-    log_store.expect_replace_range().returning(move |_from, _entries| {
+    log_store.expect_replace_range().returning(move |_from, new_entries| {
         rr_counter.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(new_entries.last().map(|e| e.index).unwrap_or(0))
     });
 
     // truncate() must NOT be called — IOTask::ReplaceRange owns the full operation
@@ -472,11 +471,9 @@ async fn test_io_task_replace_range_delegates_to_replace_range_not_truncate() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,

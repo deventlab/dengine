@@ -6,9 +6,7 @@
 
 use super::TestContext;
 use bytes::Bytes;
-use d_engine_core::{
-    BufferedRaftLog, FlushPolicy, PersistenceConfig, PersistenceStrategy, RaftLog,
-};
+use d_engine_core::{BufferedRaftLog, FlushPolicy, PersistenceConfig, RaftLog};
 use d_engine_proto::common::{Entry, EntryPayload};
 use d_engine_server::{FileStateMachine, FileStorageEngine, node::RaftTypeConfig};
 use std::collections::HashMap;
@@ -33,11 +31,9 @@ mod filter_out_conflicts_and_append_performance_tests {
         for (idle_flush_interval_ms, max_duration_ms) in test_cases {
             // Create MemFirst storage with batch policy
             let config = PersistenceConfig {
-                strategy: PersistenceStrategy::MemFirst,
                 flush_policy: FlushPolicy::Batch {
                     idle_flush_interval_ms,
                 },
-                max_buffered_entries: 10000,
                 shutdown_timeout_ms: 5000,
             };
 
@@ -104,11 +100,9 @@ mod filter_out_conflicts_and_append_performance_tests {
         for (idle_flush_interval_ms, max_duration_ms) in test_cases {
             // Create MemFirst storage with batch policy
             let config = PersistenceConfig {
-                strategy: PersistenceStrategy::MemFirst,
                 flush_policy: FlushPolicy::Batch {
                     idle_flush_interval_ms,
                 },
-                max_buffered_entries: 10000,
                 shutdown_timeout_ms: 5000,
             };
 
@@ -171,7 +165,6 @@ mod filter_out_conflicts_and_append_performance_tests {
 async fn test_last_entry_id_performance() {
     // Set up test context
     let test_context = TestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 360_000,
         },
@@ -225,16 +218,26 @@ async fn test_performance_benchmarks() {
     // Adjust test parameters according to the environment
     let operations = if is_ci {
         // CI environment uses a more relaxed threshold
+        //
+        // append_entries now round-trips through a dedicated IO thread via
+        // oneshot (see #444: leader's own write must reach the storage
+        // engine before counting toward quorum) — this is an intentional
+        // correctness/speed tradeoff, not a regression. The old threshold
+        // (500) predates that fix. New floor leaves ~2x headroom below the
+        // observed ~318-328 ops/sec on a modern dev machine, keeping the
+        // 2:1 local:CI ratio from before.
         [
-            ("append_entries", 500, 500.0),
+            ("append_entries", 500, 100.0),
             ("get_entries_range", 2500, 25000.0),
             ("entry_lookup", 5000, 100000.0),
             ("term_queries", 4000, 25000.0),
         ]
     } else {
         // Local environment uses a stricter threshold
+        //
+        // See CI-branch comment above — same #444 rationale.
         [
-            ("append_entries", 1000, 1000.0),
+            ("append_entries", 1000, 200.0),
             ("get_entries_range", 5000, 50000.0),
             ("entry_lookup", 10000, 200000.0),
             ("term_queries", 8000, 50000.0),
@@ -242,7 +245,6 @@ async fn test_performance_benchmarks() {
     };
 
     let ctx = TestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 100,
         },
@@ -332,7 +334,6 @@ async fn test_read_performance_under_concurrent_write_load() {
     };
 
     let ctx = TestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 100,
         },

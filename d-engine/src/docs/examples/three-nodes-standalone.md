@@ -59,9 +59,7 @@ default_policy = "LeaseRead"
 lease_duration_ms = 500
 
 [raft.persistence]
-strategy = "MemFirst"  # Only strategy in v0.2.4+ (DiskFirst removed)
 flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
-max_buffered_entries = 10000
 ```
 
 **Key differences from single-node expansion:**
@@ -123,7 +121,7 @@ All performance reports in `/benches/standalone-bench/reports` use this exact co
 
 **Raft settings:**
 
-- Persistence: `MemFirst` (only strategy in v0.2.4+) with 1000ms idle flush interval
+- Persistence: batched fsync (Level 3, fdatasync) with 1000ms idle flush interval
 - Read consistency: `LeaseRead` (500ms lease duration)
 - Replication: Batched append entries (5000 threshold, 0ms delay)
 - Network: Tuned for high throughput (see `config/n1.toml` for details)

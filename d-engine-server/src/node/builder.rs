@@ -367,9 +367,31 @@ where
             GrpcTransport::new_with_channels(node_id, peer_failure_tx, peer_success_tx)
         });
 
-        let snapshot_policy = self.snapshot_policy.take().unwrap_or(LogSizePolicy::new(
-            node_config.raft.snapshot.max_log_entries_before_snapshot,
-        ));
+        let max_log_entries = node_config.raft.snapshot.max_log_entries_before_snapshot;
+
+        // Startup memory-budget line — visible on stdout regardless of log setup.
+        {
+            const EST_LOG_ENTRY_BYTES: u64 = 512; // small/medium KV write + proto + SkipMap node overhead
+            let peak_mb = max_log_entries.saturating_mul(EST_LOG_ENTRY_BYTES) / (1024 * 1024);
+            tracing::info!(
+                node_id,
+                max_log_entries,
+                est_peak_ram_mb = peak_mb,
+                "Raft log memory: peak ~{peak_mb} MB in memory between snapshots \
+                        ({max_log_entries} entries × ~512 B/entry est.), purged after each snapshot"
+            );
+            if peak_mb > 100 {
+                tracing::warn!(
+                    node_id,
+                    est_peak_ram_mb = peak_mb,
+                    "in-memory Raft log budget > 100 MB — lower \
+                       raft.snapshot.max_log_entries_before_snapshot if RAM-constrained"
+                );
+            }
+        }
+
+        let snapshot_policy =
+            self.snapshot_policy.take().unwrap_or(LogSizePolicy::new(max_log_entries));
 
         let shutdown_signal = self.shutdown_signal.clone();
 

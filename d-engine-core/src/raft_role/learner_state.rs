@@ -22,6 +22,7 @@ use crate::alias::MOF;
 use crate::cluster_printer::print_learner_join_success;
 use crate::cluster_printer::print_learner_promoted_to_voter;
 use crate::cluster_printer::print_role_transition_line;
+use crate::role_state::PendingAck;
 use crate::role_state::schedule_and_execute_purge;
 use async_trait::async_trait;
 use d_engine_proto::common::LogId;
@@ -35,6 +36,7 @@ use d_engine_proto::server::cluster::LeaderDiscoveryResponse;
 use d_engine_proto::server::election::VoteResponse;
 use d_engine_proto::server::election::VotedFor;
 use d_engine_proto::server::storage::SnapshotMetadata;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -87,6 +89,10 @@ pub struct LearnerState<T: TypeConfig> {
     /// Any log entry with index ≤ `last_purged_index` is guaranteed to be
     /// reflected in the latest snapshot.
     pub last_purged_index: Option<LogId>,
+
+    /// AppendEntries responses withheld pending this node's own durable_index.
+    /// See `role_state::PendingAck`.
+    pending_append_acks: BTreeMap<u64, PendingAck>,
 
     // -- Snapshot Management --
     /// Prevents concurrent snapshot creation
@@ -514,6 +520,10 @@ impl<T: TypeConfig> RaftRoleState for LearnerState<T> {
     fn pending_purge_upto_mut(&mut self) -> Option<&mut Option<LogId>> {
         Some(&mut self.pending_purge_upto)
     }
+
+    fn pending_append_acks_mut(&mut self) -> Option<&mut BTreeMap<u64, PendingAck>> {
+        Some(&mut self.pending_append_acks)
+    }
 }
 
 impl<T: TypeConfig> LearnerState<T> {
@@ -537,6 +547,7 @@ impl<T: TypeConfig> LearnerState<T> {
             shared_state: SharedState::new(node_id, None, None),
             last_purged_index: None,
             snapshot_in_progress: AtomicBool::new(false),
+            pending_append_acks: BTreeMap::new(),
             node_config,
             _marker: PhantomData,
             pending_purge_upto: None,
@@ -646,6 +657,7 @@ impl<T: TypeConfig> From<&FollowerState<T>> for LearnerState<T> {
             shared_state: follower_state.shared_state.clone(),
             node_config: follower_state.node_config.clone(),
             snapshot_in_progress: AtomicBool::new(false),
+            pending_append_acks: BTreeMap::new(),
             last_purged_index: follower_state.last_purged_index,
             pending_purge_upto: follower_state.pending_purge_upto,
             _marker: PhantomData,
@@ -658,6 +670,7 @@ impl<T: TypeConfig> From<&CandidateState<T>> for LearnerState<T> {
             shared_state: candidate_state.shared_state.clone(),
             node_config: candidate_state.node_config.clone(),
             snapshot_in_progress: AtomicBool::new(false),
+            pending_append_acks: BTreeMap::new(),
             last_purged_index: candidate_state.last_purged_index,
             pending_purge_upto: None,
             _marker: PhantomData,

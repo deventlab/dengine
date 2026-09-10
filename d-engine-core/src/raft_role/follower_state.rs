@@ -7,6 +7,7 @@ use d_engine_proto::server::cluster::ClusterConfUpdateResponse;
 use d_engine_proto::server::cluster::LeaderDiscoveryResponse;
 use d_engine_proto::server::election::VoteResponse;
 use d_engine_proto::server::storage::SnapshotMetadata;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ use crate::RaftNodeConfig;
 use crate::Result;
 use crate::StateTransitionError;
 use crate::TypeConfig;
+use crate::role_state::PendingAck;
 use crate::role_state::schedule_and_execute_purge;
 use crate::utils::cluster::error;
 use crate::utils::cluster_printer::print_role_transition_line;
@@ -72,6 +74,10 @@ pub struct FollowerState<T: TypeConfig> {
     /// === Persistent State ===
     /// Last physically purged log index (inclusive)
     pub last_purged_index: Option<LogId>,
+
+    /// AppendEntries responses withheld pending this node's own durable_index.
+    /// See `role_state::PendingAck`.
+    pending_append_acks: BTreeMap<u64, PendingAck>,
 
     // -- Snapshot Management --
     /// Prevents concurrent snapshot creation
@@ -463,6 +469,12 @@ impl<T: TypeConfig> RaftRoleState for FollowerState<T> {
     fn pending_purge_upto_mut(&mut self) -> Option<&mut Option<LogId>> {
         Some(&mut self.pending_purge_upto)
     }
+
+    fn pending_append_acks_mut(
+        &mut self
+    ) -> Option<&mut std::collections::BTreeMap<u64, super::role_state::PendingAck>> {
+        Some(&mut self.pending_append_acks)
+    }
 }
 
 impl<T: TypeConfig> FollowerState<T> {
@@ -484,6 +496,7 @@ impl<T: TypeConfig> FollowerState<T> {
                 node_config.raft.election.election_timeout_max,
             )),
             node_config,
+            pending_append_acks: BTreeMap::new(),
             snapshot_in_progress: AtomicBool::new(false),
             _marker: PhantomData,
             last_purged_index: None,
@@ -511,6 +524,7 @@ impl<T: TypeConfig> From<&CandidateState<T>> for FollowerState<T> {
             )),
             node_config: candidate_state.node_config.clone(),
             snapshot_in_progress: AtomicBool::new(false),
+            pending_append_acks: BTreeMap::new(),
             last_purged_index: candidate_state.last_purged_index,
             // scheduled_purge_upto: None,
             _marker: PhantomData,
@@ -527,6 +541,7 @@ impl<T: TypeConfig> From<&LeaderState<T>> for FollowerState<T> {
                 leader_state.node_config.raft.election.election_timeout_max,
             )),
             node_config: leader_state.node_config.clone(),
+            pending_append_acks: BTreeMap::new(),
             snapshot_in_progress: AtomicBool::new(
                 leader_state.snapshot_in_progress.load(Ordering::SeqCst),
             ),
@@ -548,6 +563,7 @@ impl<T: TypeConfig> From<&LearnerState<T>> for FollowerState<T> {
             )),
             node_config: learner_state.node_config.clone(),
             snapshot_in_progress: AtomicBool::new(false),
+            pending_append_acks: BTreeMap::new(),
             last_purged_index: learner_state.last_purged_index,
             pending_purge_upto: learner_state.pending_purge_upto,
             _marker: PhantomData,

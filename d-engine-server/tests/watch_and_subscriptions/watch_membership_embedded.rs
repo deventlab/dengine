@@ -125,8 +125,6 @@ learner_check_throttle_ms = 100
 election_timeout_min = 300
 election_timeout_max = 3000
 
-[raft.persistence]
-strategy = "MemFirst"
 
 [retry.election]
 max_retries = 5

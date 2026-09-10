@@ -3,15 +3,14 @@ use std::time::Duration;
 use futures::future::join_all;
 use tokio;
 
+use crate::FlushPolicy;
 use crate::storage::raft_log::RaftLog;
 use crate::test_utils::{BufferedRaftLogTestContext, simulate_insert_command};
-use crate::{FlushPolicy, PersistenceStrategy};
 use d_engine_proto::common::{Entry, LogId};
 
 #[tokio::test]
 async fn test_remove_range_with_concurrent_reads() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -54,7 +53,6 @@ async fn test_remove_range_with_concurrent_reads() {
 #[tokio::test]
 async fn test_concurrent_append_and_purge() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 50,
         },
@@ -128,7 +126,6 @@ async fn test_get_entries_range_never_returns_torn_result_during_concurrent_purg
     const ITERATIONS: usize = 500;
 
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },

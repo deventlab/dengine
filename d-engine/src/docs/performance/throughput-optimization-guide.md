@@ -23,18 +23,6 @@ pub(crate) enum ConnectionType {
 
 ## Persistence Strategy & Throughput/Latency Trade-offs
 
-`MemFirst` is the only persistence strategy in v0.2.4+. It batches writes to OS page cache and flushes with fsync asynchronously — committing data to disk before notifying Raft.
-
-### Strategy Configuration
-
-```toml
-[raft.persistence]
-strategy = "MemFirst"
-flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
-```
-
-### `MemFirst` Strategy
-
 - **Write Path**: Entries are written to OS page cache via `db.write()` / `file.write()`; the IO
   thread batches them and calls fsync (`flush_wal(true)` / `sync_all()`) before advancing
   `durable_index`. Raft only counts an entry toward quorum after fsync completes.
@@ -54,8 +42,7 @@ flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
   - Lower values reduce the unflushed batch window but increase IO pressure.
   - Default `1000` ms is suitable for most workloads.
 
-> **Note**: `DiskFirst` strategy was removed in v0.2.4. `MemFirst` replaced it with batched
-> fsync — multiple writes share one fsync call, reducing IO overhead while still providing
+> **Note**: Writes are batched into a single fsync, reducing IO overhead while still providing
 > disk-level durability for all client-acknowledged (committed) writes.
 
 ## Batching Configuration
@@ -179,7 +166,7 @@ tonic::transport::Server::builder()
 
 ```
 
-Inbound message size is the one setting that *is* per-service rather than
+Inbound message size is the one setting that _is_ per-service rather than
 transport-wide, so it's applied on each `XxxServiceServer` individually:
 
 ```rust,ignore
@@ -197,7 +184,7 @@ RaftReplicationServiceServer::from_arc(node.clone())
 | p99.9 Latency | 14015 µs    | 11279 µs    | -19.5%     |
 
 > **Key improvement**: 15% reduction in tail latency - critical for consensus stability  
-> **Note**: These metrics show the impact of connection pooling optimization. These results can be further improved by tuning the PersistenceStrategy for your specific workload.
+> **Note**: These metrics show the impact of connection pooling optimization. These results can be further improved by tuning `FlushPolicy` for your specific workload.
 >
 > For absolute performance benchmarks, see [v0.2.4 Performance Report](https://github.com/deventlab/d-engine/tree/main/benches/reports/v0.2.4/bench_report_v0.2.4.md)
 
@@ -230,7 +217,7 @@ RaftReplicationServiceServer::from_arc(node.clone())
 
    ```
 
-5. **Monitor Flush Lag**: When using `MemFirst`, monitor the difference between `last_log_index` and `durable_index`. A growing gap indicates the disk is not keeping up with writes, increasing potential data loss.
+5. **Monitor Flush Lag**: Monitor the difference between `last_log_index` and `durable_index`. Raft only counts an entry toward quorum and acknowledges it to the client after fsync — so a growing gap does not put acknowledged writes at risk. It does mean client-facing write latency is growing, and (if the gap keeps growing) the amount of work an unflushed batch would need to redo on restart is growing too.
 
 ## Anti-Patterns to Avoid
 
@@ -244,11 +231,9 @@ get_peer_channel(peer_id, ConnectionType::Control).await?;
 client.request_vote(...)
 
 // DON'T: Set idle_flush_interval_ms too low — defeats batching.
-[strategy = "MemFirst"]
 flush_policy = { Batch = { idle_flush_interval_ms = 1 } } // Near-synchronous; low throughput
 
 // DO: Use a generous idle interval to amortize disk I/O cost.
-[strategy = "MemFirst"]
 flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
 
 ```
@@ -261,8 +246,8 @@ flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
    Control: Low latency ↔ Data: High throughput ↔ Bulk: Bandwidth
 3. **Improves fault containment**
    Connection issues affect only one operation type
-4. **Decouples Performance from Durability**
-   `MemFirst` with tunable `idle_flush_interval_ms` lets you balance write throughput against flush frequency.
+4. **Decouples Performance from Ack Latency**
+   Client-acknowledged writes are always fsync-durable — that's not tunable. `idle_flush_interval_ms` lets you balance write throughput against how long a client waits for that fsync.
 
 ## Reference Deployment Configurations
 
@@ -277,7 +262,6 @@ Adjust values based on snapshot size, log append rate, and cluster size.
 
 ```toml
 [raft.persistence]
-strategy = "MemFirst"
 flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
 
 [network.control]
@@ -306,7 +290,6 @@ max_concurrent_streams = 128
 
 ```toml
 [raft.persistence]
-strategy = "MemFirst"
 flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
 
 [network.control]
@@ -325,7 +308,7 @@ max_concurrent_streams = 256
 
 ```
 
-**Tip**: For public cloud, moderate concurrency and 32MB bulk windows ensure stable snapshot streaming without affecting heartbeats. The batch policy is tuned for high throughput with a reasonable data loss window.
+**Tip**: For public cloud, moderate concurrency and 32MB bulk windows ensure stable snapshot streaming without affecting heartbeats. The batch policy is tuned for high throughput; acknowledged writes are never at risk regardless of the interval, only ack latency and unflushed-batch replay time on restart scale with it.
 
 ### 3. 5-Node High-Durability Cluster (Production)
 
@@ -335,8 +318,7 @@ max_concurrent_streams = 256
 
 ```toml
 [raft.persistence]
-strategy = "MemFirst"
-flush_policy = { Batch = { idle_flush_interval_ms = 100 } }  # More frequent flush for durability
+flush_policy = { Batch = { idle_flush_interval_ms = 100 } }  # More frequent flush, shorter ack latency
 
 [network.control]
 connection_window_size = 4_194_304   # 4MB
@@ -354,7 +336,7 @@ max_concurrent_streams = 512
 
 ```
 
-**Tip**: For higher write persistence within a process lifecycle, lower `idle_flush_interval_ms` (e.g., 100ms). Note: `MemFirst` is not power-loss safe regardless of flush interval.
+**Tip**: Lower `idle_flush_interval_ms` (e.g., 100ms) shortens client-facing write latency and shrinks the unflushed-batch window an IO thread has to redo on restart. Acknowledged writes are power-loss safe regardless of this setting — Raft only counts an entry toward quorum, and acknowledges it to the client, after fsync completes.
 
 ## Network Environment Tuning Recommendations
 
@@ -362,12 +344,12 @@ These parameters are primarily **network-dependent**, not CPU/memory dependent.
 
 Adjust them based on latency, packet loss, and connection stability.
 
-| **Environment**                  | **tcp_keepalive_in_secs** | **http2_keep_alive_interval_in_secs** | **http2_keep_alive_timeout_in_secs** | **Notes**                                              |
-| -------------------------------- | ------------------------- | ------------------------------------- | ------------------------------------ | ------------------------------------------------------- |
-| **Local / In-Cluster (LAN)**     | 60                        | 10                                    | 5                                    | Low latency & stable; defaults are fine                 |
-| **Cross-Region / Stable WAN**    | 60                        | 15                                    | 8                                    | Slightly longer keep-alive to avoid false disconnects   |
-| **Public Cloud / Moderate Loss** | 60                        | 20                                    | 10                                   | Higher interval & timeout for lossy links                |
-| **High Latency / Unstable WAN**  | 120                       | 30                                    | 15                                   | Longer timeouts prevent spurious drops                   |
+| **Environment**                  | **tcp_keepalive_in_secs** | **http2_keep_alive_interval_in_secs** | **http2_keep_alive_timeout_in_secs** | **Notes**                                             |
+| -------------------------------- | ------------------------- | ------------------------------------- | ------------------------------------ | ----------------------------------------------------- |
+| **Local / In-Cluster (LAN)**     | 60                        | 10                                    | 5                                    | Low latency & stable; defaults are fine               |
+| **Cross-Region / Stable WAN**    | 60                        | 15                                    | 8                                    | Slightly longer keep-alive to avoid false disconnects |
+| **Public Cloud / Moderate Loss** | 60                        | 20                                    | 10                                   | Higher interval & timeout for lossy links             |
+| **High Latency / Unstable WAN**  | 120                       | 30                                    | 15                                   | Longer timeouts prevent spurious drops                |
 
 **Guidelines:**
 

@@ -55,6 +55,8 @@ RUN apt-get update && \
     iptables \
     iproute2 \
     libc6 \
+    libfuse3-3 \
+    fuse3 \
     tzdata && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /var/run/sshd && \
@@ -85,4 +87,4 @@ COPY examples/three-nodes-standalone/docker/monitoring/promtail/config.yml /etc/
 
 WORKDIR /app
 
-CMD ["sh", "-c", "/usr/sbin/sshd -D & CONFIG_PATH=$CONFIG_PATH LOG_DIR=$LOG_DIR METRICS_PORT=$METRICS_PORT RUST_LOG=demo=$LOG_LEVEL,d_engine=$LOG_LEVEL,hyper=warn,sled=warn demo & promtail --config.file=/etc/promtail/config.yml > /app/logs/promtail.log 2>&1"]
+CMD ["sh", "-c", "/usr/sbin/sshd -D & CONFIG_PATH=$CONFIG_PATH LOG_DIR=$LOG_DIR METRICS_PORT=$METRICS_PORT DB_PATH=/app/db/$ID RUST_LOG=demo=$LOG_LEVEL,d_engine=$LOG_LEVEL,hyper=warn,sled=warn demo & promtail --config.file=/etc/promtail/config.yml > /app/logs/promtail.log 2>&1"]

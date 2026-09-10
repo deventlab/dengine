@@ -8,12 +8,11 @@
 use d_engine_proto::common::Entry;
 
 use crate::test_utils::BufferedRaftLogTestContext;
-use crate::{FlushPolicy, PersistenceStrategy, RaftLog};
+use crate::{FlushPolicy, RaftLog};
 
 #[tokio::test]
 async fn test_first_index_for_term() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -88,7 +87,6 @@ async fn test_first_index_for_term() {
 #[tokio::test]
 async fn test_last_index_for_term() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -162,7 +160,6 @@ async fn test_last_index_for_term() {
 #[tokio::test]
 async fn test_term_index_functions_with_purged_logs() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -214,7 +211,6 @@ async fn test_term_index_functions_with_purged_logs() {
 #[tokio::test]
 async fn test_term_index_sequential_multi_term_insertion() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1000,
         },
@@ -263,7 +259,6 @@ async fn test_term_index_sequential_multi_term_insertion() {
 #[tokio::test]
 async fn test_term_indexes_rebuilt_correctly_after_restart() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -304,7 +299,6 @@ async fn test_term_indexes_rebuilt_correctly_after_restart() {
 #[tokio::test]
 async fn test_term_index_performance_large_dataset() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 5000,
         },

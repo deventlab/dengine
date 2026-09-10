@@ -263,7 +263,7 @@ impl MockStorageEngine {
             } else {
                 data.insert(last_key, new_last_index.to_be_bytes().to_vec());
             }
-            Ok(())
+            Ok(new_last_index)
         });
     }
 
@@ -322,7 +322,7 @@ impl MockStorageEngine {
     /// After a failed fsync, `batch_processor` logs the error and does NOT zero
     /// `pending_max` (the success branch `else { pending_max = 0 }` is not taken).
     /// This is the deterministic pre-condition needed to exercise the bug where
-    /// `handle_non_write_cmd(IOTask::Reset)` forgets to zero `pending_max`.
+    /// `run_storage_tasks(IOTask::Reset)` forgets to zero `pending_max`.
     pub fn not_durable_first_flush_fails(id: String) -> Self {
         let mut mock_log_store = MockLogStore::new();
         let mut mock_meta_store = MockMetaStore::new();
@@ -393,7 +393,7 @@ impl MockStorageEngine {
 
     /// Create a MockStorageEngine where `replace_range()` always fails,
     /// simulating a fatal storage error during conflict-resolution
-    /// (truncate + write). `handle_non_write_cmd`'s `IOTask::ReplaceRange`
+    /// (truncate + write). `run_storage_tasks`'s `IOTask::ReplaceRange`
     /// arm treats this as unrecoverable — disk state is now uncertain.
     pub fn not_durable_replace_range_fails(id: String) -> Self {
         let mut mock_log_store = MockLogStore::new();
@@ -625,6 +625,57 @@ impl MockStorageEngine {
             Err(crate::Error::Fatal("simulated fsync failure".into()))
         });
         mock_log_store.expect_flush_async().returning(|| Ok(()));
+
+        let engine = Self {
+            log_store: Arc::new(mock_log_store),
+            meta_store: Arc::new(mock_meta_store),
+            instance_id: id,
+        };
+
+        (engine, tx)
+    }
+
+    /// Create a MockStorageEngine where the first `persist_entries()` call blocks
+    /// until the returned sender fires. `flush()`/`is_write_durable()` are left at
+    /// their always-succeeds default (`configure_durable`) — this gate is only
+    /// about the write-to-storage-engine step, not fsync.
+    ///
+    /// Use this to freeze the IO thread mid-persist so a concurrent truncation
+    /// can be driven deterministically — see
+    /// `durable_index_truncation_clamp_test.rs`.
+    pub fn not_durable_gated_persist(id: String) -> (Self, std::sync::mpsc::Sender<()>) {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Mutex::new(Some(rx));
+
+        let mut mock_log_store = MockLogStore::new();
+        let mut mock_meta_store = MockMetaStore::new();
+
+        Self::configure_mocks(&mut mock_log_store, &mut mock_meta_store, &id);
+        // persist_entries is gated below instead of via configure_persist_entries_success.
+        Self::configure_replace_range_success(&mut mock_log_store, &id);
+        Self::configure_purge_success(&mut mock_log_store);
+        Self::configure_reset_success(&mut mock_log_store, &id);
+        Self::configure_save_hard_state_success(&mut mock_meta_store, &id);
+        Self::configure_durable(&mut mock_log_store);
+
+        let instance_id_ref = id.clone();
+        mock_log_store.expect_persist_entries().returning(move |entries| {
+            // Only the first call blocks — take() leaves None for subsequent calls.
+            if let Some(gate) = rx.lock().unwrap().take() {
+                let _ = gate.recv(); // blocks until the test sends ()
+            }
+            let mut data = MOCK_STORAGE_DATA.lock().unwrap();
+            for entry in &entries {
+                let key = format!("{instance_id_ref}_entry_{}", entry.index);
+                let value = bincode::serialize(entry).unwrap();
+                data.insert(key, value);
+            }
+            if let Some(last_entry) = entries.last() {
+                let key = format!("{instance_id_ref}_last_index");
+                data.insert(key, last_entry.index.to_be_bytes().to_vec());
+            }
+            Ok(())
+        });
 
         let engine = Self {
             log_store: Arc::new(mock_log_store),

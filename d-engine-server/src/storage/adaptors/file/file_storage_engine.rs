@@ -350,7 +350,7 @@ impl LogStore for FileLogStore {
         &self,
         from_index: u64,
         new_entries: Vec<Entry>,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let encoded: Vec<Vec<u8>> = new_entries.iter().map(|e| e.encode_to_vec()).collect();
 
         let new_last = {
@@ -378,7 +378,7 @@ impl LogStore for FileLogStore {
         };
 
         self.last_index.store(new_last, Ordering::SeqCst);
-        Ok(())
+        Ok(new_last)
     }
 
     fn is_write_durable(&self) -> bool {

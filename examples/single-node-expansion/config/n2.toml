@@ -28,9 +28,7 @@ lease_duration_ms = 500
 
 
 [raft.persistence]
-strategy = "MemFirst"
 flush_policy = { Batch = { idle_flush_interval_ms = 20 } }
-max_buffered_entries = 10000
 
 [raft.snapshot]
 enable = false

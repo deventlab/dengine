@@ -13,7 +13,6 @@ use d_engine_core::config::BackoffPolicy;
 use d_engine_core::config::ElectionConfig;
 use d_engine_core::config::FlushPolicy;
 use d_engine_core::config::PersistenceConfig;
-use d_engine_core::config::PersistenceStrategy;
 use d_engine_core::config::RaftConfig;
 use d_engine_core::config::RaftNodeConfig;
 use d_engine_core::config::SnapshotConfig;
@@ -124,7 +123,6 @@ pub async fn create_node_config(
         ]
 
         [raft.persistence]
-        strategy = "MemFirst"
         flush_policy = {{ Batch = {{ threshold = 100, idle_flush_interval_ms = 1 }} }}
 
         [raft.election]
@@ -174,7 +172,6 @@ pub async fn create_node_config_with_role(
         ]
 
         [raft.persistence]
-        strategy = "MemFirst"
         flush_policy = {{ Batch = {{ threshold = 1, idle_flush_interval_ms = 1 }} }}
 
         [raft.election]
@@ -218,7 +215,6 @@ pub fn node_config(cluster_toml: &str) -> RaftNodeConfig {
             ..Default::default()
         },
         persistence: PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 1,
             },

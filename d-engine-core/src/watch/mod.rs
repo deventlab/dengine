@@ -87,6 +87,7 @@
 //!     watcher_buffer_size: 256,
 //!     enable_metrics: true,
 //!     max_watcher_count: 5000,
+//!     heartbeat_interval_ms: 30_000,
 //! };
 //! ```
 //!

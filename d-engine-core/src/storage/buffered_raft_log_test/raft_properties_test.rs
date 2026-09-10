@@ -1,12 +1,11 @@
+use crate::FlushPolicy;
 use crate::storage::raft_log::RaftLog;
 use crate::test_utils::{BufferedRaftLogTestContext, simulate_insert_command};
-use crate::{FlushPolicy, PersistenceStrategy};
 use d_engine_proto::common::Entry;
 
 #[tokio::test]
 async fn test_log_matching_property() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -45,8 +44,7 @@ async fn test_log_matching_property() {
 
 #[tokio::test]
 async fn test_leader_completeness_property() {
-    let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
+    let mut ctx = BufferedRaftLogTestContext::new(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -56,6 +54,7 @@ async fn test_leader_completeness_property() {
     // Leader writes entries and flushes so durable_index = 10
     ctx.append_entries(1, 10, 1).await;
     ctx.raft_log.flush().await.unwrap();
+    ctx.drain_fsync_completions();
 
     // Simulate majority replication scenario:
     // Leader has: [1,2,3,4,5,6,7,8,9,10], durable_index=10
@@ -83,8 +82,7 @@ async fn test_leader_completeness_property() {
 
 #[tokio::test]
 async fn test_calculate_majority_matched_index_case0() {
-    let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
+    let mut ctx = BufferedRaftLogTestContext::new(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -97,6 +95,7 @@ async fn test_calculate_majority_matched_index_case0() {
 
     simulate_insert_command(&ctx.raft_log, vec![1], 1).await;
     simulate_insert_command(&ctx.raft_log, vec![2, 3], 2).await;
+    ctx.drain_fsync_completions();
 
     assert_eq!(
         Some(3),
@@ -108,7 +107,6 @@ async fn test_calculate_majority_matched_index_case0() {
 #[tokio::test]
 async fn test_calculate_majority_matched_index_case1() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -131,8 +129,7 @@ async fn test_calculate_majority_matched_index_case1() {
 
 #[tokio::test]
 async fn test_calculate_majority_matched_index_case2() {
-    let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
+    let mut ctx = BufferedRaftLogTestContext::new(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -148,6 +145,7 @@ async fn test_calculate_majority_matched_index_case2() {
     simulate_insert_command(&ctx.raft_log, vec![1], 1).await;
     simulate_insert_command(&ctx.raft_log, vec![2], 2).await;
     simulate_insert_command(&ctx.raft_log, vec![3], 3).await;
+    ctx.drain_fsync_completions();
     assert_eq!(
         Some(3),
         ctx.raft_log.calculate_majority_matched_index(ct, ci, vec![4, 2])
@@ -157,7 +155,6 @@ async fn test_calculate_majority_matched_index_case2() {
 #[tokio::test]
 async fn test_calculate_majority_matched_index_case3() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -180,7 +177,6 @@ async fn test_calculate_majority_matched_index_case3() {
 #[tokio::test]
 async fn test_calculate_majority_matched_index_case4() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -203,8 +199,7 @@ async fn test_calculate_majority_matched_index_case4() {
 
 #[tokio::test]
 async fn test_calculate_majority_matched_index_case5() {
-    let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
+    let mut ctx = BufferedRaftLogTestContext::new(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -223,6 +218,7 @@ async fn test_calculate_majority_matched_index_case5() {
 
     let raft_log_entry_ids: Vec<u64> = (1..=raft_log_length).collect();
     simulate_insert_command(&ctx.raft_log, raft_log_entry_ids, 1).await;
+    ctx.drain_fsync_completions();
 
     assert_eq!(
         Some(peer2_match),

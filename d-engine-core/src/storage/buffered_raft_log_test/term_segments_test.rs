@@ -16,7 +16,7 @@ use d_engine_proto::common::Entry;
 
 use crate::storage::buffered_raft_log::TermSegments;
 use crate::test_utils::BufferedRaftLogTestContext;
-use crate::{FlushPolicy, PersistenceStrategy, RaftLog};
+use crate::{FlushPolicy, RaftLog};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,7 +37,6 @@ fn entries(
 
 fn ctx(name: &str) -> BufferedRaftLogTestContext {
     BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 50,
         },

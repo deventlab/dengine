@@ -11,7 +11,7 @@ initial_cluster = [
 [raft]
 general_raft_timeout_duration_in_ms = 100
 cmd_channel_capacity = 1024
-ordered_channel_capacity = 1024
+max_pending_append_responses = 1024
 
 [raft.election]
 election_timeout_min = 1000
@@ -39,12 +39,7 @@ max_pending_reads = 500
 
 
 [raft.persistence]
-# strategy = "DiskFirst"
-strategy = "MemFirst"
 flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
-# Maximum number of log entries to buffer in memory
-# when using async persistence strategies (MemFirst/Batched)
-max_buffered_entries = 10000
 
 [raft.snapshot]
 enable = true

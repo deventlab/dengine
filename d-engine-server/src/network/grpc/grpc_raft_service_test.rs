@@ -3,12 +3,15 @@ use std::time::Duration;
 use crate::ApplyResult;
 use d_engine_core::AppendResponseWithUpdates;
 use d_engine_core::InternalEvent;
+use d_engine_core::MaybeCloneOneshot;
+use d_engine_core::MaybeCloneOneshotReceiver;
 use d_engine_core::MockElectionCore;
 use d_engine_core::MockMembership;
 use d_engine_core::MockRaftLog;
 use d_engine_core::MockReplicationCore;
 use d_engine_core::MockTypeConfig;
 use d_engine_core::RaftNodeConfig;
+use d_engine_core::RaftOneshot;
 use d_engine_core::convert::safe_kv_bytes;
 use d_engine_proto::client::ClientReadRequest;
 use d_engine_proto::client::ClientWriteRequest;
@@ -603,5 +606,177 @@ async fn test_handle_client_scan_not_leader_carries_leader_hint_in_metadata() {
     assert_eq!(
         metadata.leader_address.as_deref(),
         Some("http://127.0.0.1:9082")
+    );
+}
+
+/// Historical record, not a regression guard: this is the strict-FIFO forwarder
+/// pattern `stream_append_entries` used *before* #446 (one withheld response blocked
+/// every later response on the same connection). It reconstructs the old primitives
+/// rather than calling production code, because that code no longer exists —
+/// `stream_append_entries` was rewritten to a bounded, order-tolerant forwarder (see
+/// `test_stream_append_entries_does_not_block_ready_response_behind_pending_one` for
+/// the real, current behavior). Kept only so a future reader can see what the old
+/// failure mode looked like; do not treat this as coverage of current code.
+#[tokio::test]
+async fn test_ordered_forwarder_head_of_line_blocking() {
+    let (out_tx, mut out_rx) = mpsc::channel::<Result<AppendEntriesResponse, tonic::Status>>(128);
+    let (ordered_tx, mut ordered_rx) = mpsc::channel::<
+        MaybeCloneOneshotReceiver<Result<AppendEntriesResponse, tonic::Status>>,
+    >(128);
+
+    // Mirrors grpc_raft_service.rs's forwarder loop.
+    tokio::spawn(async move {
+        while let Some(resp_rx) = ordered_rx.recv().await {
+            let result = match resp_rx.await {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(status)) => Err(status),
+                Err(_) => Err(tonic::Status::internal("Response channel closed")),
+            };
+            if out_tx.send(result).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // First item: never resolved — stands in for a response withheld pending durable_index.
+    let (_stuck_tx, stuck_rx) = MaybeCloneOneshot::new();
+    ordered_tx.send(stuck_rx).await.unwrap();
+
+    // Second item: already resolved — stands in for an unrelated, ready-to-send response
+    // (e.g. a heartbeat) that arrived right after.
+    let (ready_tx, ready_rx) = MaybeCloneOneshot::new();
+    ordered_tx.send(ready_rx).await.unwrap();
+    ready_tx.send(Ok(AppendEntriesResponse::success(1, 1, None))).unwrap();
+
+    // The second, already-ready response must not be observable yet — it's stuck
+    // behind the first, unresolved one in strict FIFO order.
+    let blocked = time::timeout(Duration::from_millis(50), out_rx.recv()).await;
+    assert!(
+        blocked.is_err(),
+        "an already-ready response was blocked behind an earlier unresolved one — \
+         confirms the forwarder is strict FIFO"
+    );
+}
+
+/// #446: `stream_append_entries` must not let a response still withheld (durable_index
+/// hasn't caught up to what it claims) block a later, unrelated response that's already
+/// answerable. Drives the real production method end-to-end — not a reconstruction —
+/// via a synthetic 2-item input stream.
+///
+/// request 1 claims index 10 while `durable_index()` is fixed at 5 — withheld,
+/// queued in `pending_append_acks`, never released in this test.
+/// request 2 claims index 3, which is `<= durable_index` — answerable immediately.
+///
+/// If the forwarder is still strict FIFO, the first item out of the response stream
+/// would have to be request 1's (never arrives) — this test would time out. If it's
+/// the new bounded/order-tolerant forwarder, request 2's response (identifiable by its
+/// distinct `last_match.term` marker) comes out first.
+#[tokio::test]
+async fn test_stream_append_entries_does_not_block_ready_response_behind_pending_one() {
+    tokio::time::pause();
+    let settings = RaftNodeConfig::new().expect("Should succeed to init RaftNodeConfig.");
+    let mut settings = settings.validate().expect("Validate RaftNodeConfig successfully");
+    settings.raft.general_raft_timeout_duration_in_ms = 200;
+    settings.raft.batching.max_batch_size = 1;
+
+    let mut membership = MockMembership::<MockTypeConfig>::new();
+    membership.expect_voters().returning(Vec::new);
+    membership.expect_members().returning(Vec::new);
+    membership.expect_replication_peers().returning(Vec::new);
+    membership.expect_get_peers_id_with_condition().returning(|_| vec![]);
+
+    let mut raft_log = MockRaftLog::new();
+    raft_log.expect_last_entry_id().returning(|| 0);
+    raft_log.expect_flush().returning(|| Ok(()));
+    raft_log.expect_load_hard_state().returning(|| Ok(None));
+    raft_log.expect_save_hard_state().returning(|_| Ok(()));
+    raft_log.expect_last_log_id().returning(|| None);
+    // Fixed durable frontier: only request 2's claimed index (3) clears it.
+    raft_log.expect_durable_index().returning(|| 5);
+
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let call_count_clone = call_count.clone();
+    let mut replication_handler = MockReplicationCore::<MockTypeConfig>::new();
+    replication_handler
+        .expect_check_append_entries_request_is_legal()
+        .returning(|my_term, _, _| AppendEntriesResponse::success(1, my_term, None));
+    replication_handler.expect_handle_append_entries().returning(move |_, _, _| {
+        let is_first = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let (claimed_index, term_marker) = if is_first { (10, 111) } else { (3, 222) };
+        Ok(AppendResponseWithUpdates {
+            response: AppendEntriesResponse::success(
+                1,
+                term_marker,
+                Some(LogId {
+                    term: term_marker,
+                    index: claimed_index,
+                }),
+            ),
+            commit_index_update: None,
+        })
+    });
+
+    let (_graceful_tx, graceful_rx) = watch::channel(());
+    let builder = MockBuilder::new(graceful_rx);
+    let node = builder
+        .with_raft_log(raft_log)
+        .with_membership(membership)
+        .with_replication_handler(replication_handler)
+        .with_node_config(settings)
+        .build_node();
+    node.set_rpc_ready(true);
+
+    let raft_lock = node.raft_core.clone();
+    let _raft_handle = tokio::spawn(async move {
+        let mut raft = raft_lock.lock().await;
+        let _ = time::timeout(Duration::from_secs(5), raft.run()).await;
+    });
+
+    tokio::time::advance(Duration::from_millis(2)).await;
+    tokio::time::sleep(Duration::from_millis(2)).await;
+
+    // request 1: prev_log_index=0. request 2: prev_log_index=99 — deliberately different
+    // from request 1's, so merge_append_entries (which only merges contiguous requests)
+    // can never combine them into a single handle_append_entries call.
+    let req1 = AppendEntriesRequest {
+        term: 1,
+        leader_id: 1,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: vec![],
+        leader_commit_index: 0,
+    };
+    let req2 = AppendEntriesRequest {
+        prev_log_index: 99,
+        ..req1.clone()
+    };
+    let stream = crate::test_utils::create_test_snapshot_stream(vec![req1, req2]);
+
+    let response = node
+        .stream_append_entries(Request::new(stream))
+        .await
+        .expect("stream_append_entries must accept the request");
+    use futures::StreamExt;
+    let mut out_stream = response.into_inner();
+
+    let first_out = time::timeout(Duration::from_secs(2), out_stream.next())
+        .await
+        .expect(
+            "the response for request 2 (already durable) must arrive without waiting for \
+             request 1 (withheld) — if this times out, the forwarder is still strict FIFO",
+        )
+        .expect("stream must yield an item")
+        .expect("must be Ok, not a transport error");
+
+    let last_match = match first_out.result {
+        Some(d_engine_proto::server::replication::append_entries_response::Result::Success(
+            success,
+        )) => success.last_match.expect("success response must carry last_match"),
+        other => panic!("expected a success response, got {other:?}"),
+    };
+    assert_eq!(
+        last_match.term, 222,
+        "the first response observed must be request 2's (marker term=222) — request 1 \
+         (marker term=111) is still withheld and must not be observed yet, nor block this one"
     );
 }

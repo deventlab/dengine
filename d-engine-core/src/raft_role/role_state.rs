@@ -31,10 +31,13 @@ use d_engine_proto::common::LogId;
 use d_engine_proto::server::election::VotedFor;
 use d_engine_proto::server::replication::AppendEntriesRequest;
 use d_engine_proto::server::replication::AppendEntriesResponse;
+use d_engine_proto::server::replication::SuccessResult;
+use d_engine_proto::server::replication::append_entries_response;
 use d_engine_proto::server::storage::SnapshotAck;
 use d_engine_proto::server::storage::SnapshotChunk;
 use d_engine_proto::server::storage::SnapshotMetadata;
 use d_engine_proto::server::storage::SnapshotResponse;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -54,6 +57,66 @@ pub(crate) enum PeerReplicationState {
     /// dispatch any AppendEntries for this peer until SnapshotPushCompleted resolves
     /// it back to Probe — regardless of success or failure.
     Snapshot,
+}
+
+/// A success `AppendEntriesResponse` that has been computed but not yet sent,
+/// because this node's own `durable_index` had not reached the index the response
+/// claims. Held until fsync catches up, so an ACK never asserts durability the
+/// node cannot yet guarantee (RPO=0, #446).
+///
+/// Keyed by the claimed index. `senders` accumulates when more than one request
+/// claims the same index (a leader retry, or a heartbeat landing on the tail).
+///
+/// The response body is not stored: it is rebuilt on release, after re-checking
+/// the term it was withheld under. A response frozen under a term the node has
+/// since left must never be sent.
+pub(crate) struct PendingAck {
+    pub(crate) claimed_term: u64,
+    pub(crate) term_when_withheld: u64,
+    pub(crate) senders:
+        Vec<MaybeCloneOneshotSender<std::result::Result<AppendEntriesResponse, Status>>>,
+}
+
+/// Send the terminal response for one withheld ACK — a rebuilt success if
+/// `confirm`, a conflict otherwise — to every accumulated sender.
+fn resolve_pending_ack(
+    node_id: u32,
+    index: u64,
+    ack: PendingAck,
+    confirm: bool,
+    current_term: u64,
+) {
+    let response = if confirm {
+        AppendEntriesResponse::success(
+            node_id,
+            current_term,
+            Some(LogId {
+                index,
+                term: ack.claimed_term,
+            }),
+        )
+    } else {
+        AppendEntriesResponse::conflict(node_id, current_term, None, None)
+    };
+    for sender in ack.senders {
+        if let Err(e) = sender.send(Ok(response)) {
+            error!("withheld AppendEntries ACK (index {index}): send failed: {e:?}");
+        }
+    }
+}
+
+/// Fail every withheld ACK with a conflict response. Used when the queue passes to
+/// a role that cannot hold it (Candidate or Leader): the node no longer recognises
+/// the leader those ACKs were owed to, so that leader's replication worker should
+/// retry now rather than wait out an RPC timeout.
+pub(crate) fn reject_pending_acks(
+    acks: BTreeMap<u64, PendingAck>,
+    node_id: u32,
+    current_term: u64,
+) {
+    for (index, ack) in acks {
+        resolve_pending_ack(node_id, index, ack, false, current_term);
+    }
 }
 
 #[async_trait]
@@ -397,16 +460,60 @@ pub(crate) trait RaftRoleState: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Handle LogFlushed(durable) event: entries up to `durable` are now crash-safe.
-    /// Leader: recalculates commit_index (uses durable_index in quorum calculation).
-    /// Default: no-op for Candidate/Follower/Learner (ACK already sent on memory write).
+    /// Release withheld AppendEntries ACKs now that the log is durable through
+    /// `durable`. For each withheld ACK:
+    ///
+    /// - withheld under a term this node has since left → fail it with a conflict.
+    ///   A higher-term leader may have overwritten the log at that index; within a
+    ///   single term a follower's entries are never replaced, so the term check
+    ///   alone is a sufficient content guard and no log lookup is needed.
+    /// - claimed index now `<= durable` → rebuild and send the success.
+    /// - otherwise → keep waiting.
+    ///
+    /// No-op for Candidate/Leader (no queue). Runs on every fsync completion, so it
+    /// stays limited to integer comparisons — no log lookup. (#446)
+    fn resolve_pending_acks(
+        &mut self,
+        durable: u64,
+    ) {
+        let node_id = self.node_id();
+        let current_term = self.current_term();
+        let Some(pending) = self.pending_append_acks_mut() else {
+            return;
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let resolved: Vec<(u64, bool)> = pending
+            .iter()
+            .filter_map(|(&index, ack)| {
+                if ack.term_when_withheld != current_term {
+                    Some((index, false)) // stale term -> conflict
+                } else if index <= durable {
+                    Some((index, true)) // durable -> success
+                } else {
+                    None // keep waiting
+                }
+            })
+            .collect();
+        for (index, confirm) in resolved {
+            if let Some(ack) = pending.remove(&index) {
+                resolve_pending_ack(node_id, index, ack, confirm, current_term);
+            }
+        }
+    }
+
+    /// A batch of log entries reached `durable` on disk (fsync complete).
+    ///
+    /// Follower/Learner: release any withheld AppendEntries ACKs this now covers.
+    /// Leader: overridden to recalculate `commit_index`. Candidate: no-op.
     async fn handle_log_flushed(
         &mut self,
-        _durable: u64,
+        durable: u64,
         _ctx: &RaftContext<Self::T>,
         _internal_event_tx: &mpsc::UnboundedSender<InternalEvent>,
     ) {
-        // Candidate: no-op
+        self.resolve_pending_acks(durable);
     }
 
     /// Handle AppendEntries result from a per-follower ReplicationWorker.
@@ -560,13 +667,53 @@ pub(crate) trait RaftRoleState: Send + Sync + 'static {
                 }
                 debug!("AppendEntriesResponse: {:?}", response);
 
-                // MemFirst: ACK immediately after memory write. IO thread fsyncs async.
-                // Safety: quorum uses last_entry_id (in-memory); crash safety is guaranteed by
-                // majority replication, not per-follower durability.
+                // RPO=0 (#446): a success response asserts the claimed entry is
+                // fsync-durable on this node. If this node's own `durable_index`
+                // has not reached that index, withhold the response until it does
+                // (released by `resolve_pending_acks`). Conflict and higher-term
+                // responses assert nothing about durability and are sent at once.
+                let claim = match &response.result {
+                    Some(append_entries_response::Result::Success(SuccessResult {
+                        last_match: Some(log_id),
+                    })) => Some((log_id.index, log_id.term)),
+                    _ => None,
+                };
 
-                for sender in senders {
-                    if let Err(e) = sender.send(Ok(response)) {
-                        error!("Failed to send: {:?}", e);
+                match claim {
+                    Some((index, claimed_term)) if ctx.storage.raft_log.durable_index() < index => {
+                        let term_when_withheld = self.current_term();
+                        match self.pending_append_acks_mut() {
+                            Some(pending) => {
+                                pending
+                                    .entry(index)
+                                    .or_insert_with(|| PendingAck {
+                                        claimed_term,
+                                        term_when_withheld,
+                                        senders: Vec::new(),
+                                    })
+                                    .senders
+                                    .extend(senders);
+                            }
+                            None => {
+                                // Only Follower and Learner produce a success
+                                // response here, and both carry the queue. Reaching
+                                // this arm means a role invariant broke — send the
+                                // ACK now rather than strand the leader.
+                                error!(
+                                    "withheld a success ACK on a role with no pending-ACK queue"
+                                );
+                                for sender in senders {
+                                    let _ = sender.send(Ok(response));
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        for sender in senders {
+                            if let Err(e) = sender.send(Ok(response)) {
+                                error!("failed to send AppendEntries response: {e:?}");
+                            }
+                        }
                     }
                 }
             }
@@ -939,6 +1086,13 @@ pub(crate) trait RaftRoleState: Send + Sync + 'static {
         _node_id: u32,
         _state: PeerReplicationState,
     ) {
+    }
+
+    /// The withheld-ACK queue, for the roles that keep one (Follower, Learner).
+    /// `None` for Candidate and Leader. Carried across a Follower<->Learner
+    /// transition by `RaftRole::take_pending_acks` / `restore_pending_acks` (#446).
+    fn pending_append_acks_mut(&mut self) -> Option<&mut BTreeMap<u64, PendingAck>> {
+        None
     }
 }
 

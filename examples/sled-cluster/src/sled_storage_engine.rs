@@ -147,7 +147,8 @@ impl LogStore for SledLogStore {
         &self,
         from_index: u64,
         new_entries: Vec<Entry>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let new_last = new_entries.last().map(|e| e.index).unwrap_or(from_index.saturating_sub(1));
         let mut batch = sled::Batch::default();
 
         // collect and remove all keys >= from_index
@@ -164,7 +165,7 @@ impl LogStore for SledLogStore {
         }
 
         self.tree.apply_batch(batch).map_err(|e| StorageError::DbError(e.to_string()))?;
-        Ok(())
+        Ok(new_last)
     }
 
     fn is_write_durable(&self) -> bool {

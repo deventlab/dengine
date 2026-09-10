@@ -77,6 +77,17 @@ pub trait RaftLog: Send + Sync + 'static {
     /// - DiskFirst: equals `last_entry_id()` (every append blocks until durable).
     fn durable_index(&self) -> u64;
 
+    /// Content-validated durable-watermark advance. `index`/`term` describe
+    /// what a completed fsync claims is now safe — rejected (`None`) if
+    /// `entry_term(index) != Some(term)`, meaning the log content at that
+    /// index has changed (truncated + replaced) since fsync started on it.
+    /// `Some(new_value)` only when it actually advanced — callers use this
+    /// to decide whether to fire `handle_log_flushed`.
+    fn try_advance_durable_index(
+        &self,
+        mark: LogId,
+    ) -> Option<u64>;
+
     /// Returns the LogId (term + index) of the last entry.
     ///
     /// # Returns
@@ -209,14 +220,14 @@ pub trait RaftLog: Send + Sync + 'static {
     ///    - Persist entries to durable storage BEFORE updating in-memory state
     ///    - Call fsync/flush before returning Ok(())
     ///    - Ensures entries survive crashes immediately
-    ///    - Example: BufferedRaftLog with PersistenceStrategy::DiskFirst
+    ///    - Example: a store that fsyncs before returning
     ///
     /// 2. **Memory-First (Performance-optimized, Acceptable for Followers)**:
     ///    - Update in-memory state first
     ///    - Enqueue entries for asynchronous durability
     ///    - MUST guarantee eventual durability via background flush
     ///    - MUST call flush() before acknowledging commits
-    ///    - Example: BufferedRaftLog with PersistenceStrategy::MemFirst
+    ///    - Example: a store that fsyncs asynchronously
     ///    - WARNING: Leader MUST wait_durable() before responding to AppendEntries RPCs
     ///
     /// # Safety Invariants
@@ -228,10 +239,10 @@ pub trait RaftLog: Send + Sync + 'static {
     /// - MUST update term indexes (first/last_index_for_term) atomically
     ///
     /// # Raft Protocol Integration
-    /// - Leaders using MemFirst MUST call wait_durable(index) before:
+    /// - Leaders using async fsync MUST call wait_durable(index) before:
     ///   * Responding success to AppendEntries RPC
     ///   * Advancing commit index
-    /// - Followers can use MemFirst safely because leader durability guarantees safety
+    /// - Followers can use async fsync safely because leader durability guarantees safety
     ///
     /// # Failure Semantics
     /// - On error, implementer MAY roll back partial writes
@@ -252,7 +263,7 @@ pub trait RaftLog: Send + Sync + 'static {
     ///
     /// # Usage Pattern
     /// ```rust,ignore
-    /// // Leader with MemFirst strategy
+    /// // Leader with async fsync
     /// raft_log.append_entries(new_entries).await?;
     /// raft_log.wait_durable(max_index).await?;  // MUST wait before RPC response
     /// respond_to_client(Ok(()));
@@ -261,7 +272,7 @@ pub trait RaftLog: Send + Sync + 'static {
     /// # Safety Invariants
     /// - MUST NOT return until flush() for this index completes successfully
     /// - If implementation doesn't support async durability, return Ok(()) immediately
-    /// - Critical for MemFirst strategy correctness
+    /// - Critical for async-fsync correctness
     async fn wait_durable(
         &self,
         index: u64,

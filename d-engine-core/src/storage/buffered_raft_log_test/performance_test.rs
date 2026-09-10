@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use crate::{
     BufferedRaftLog, FlushPolicy, MockLogStore, MockMetaStore, MockStorageEngine, MockTypeConfig,
-    PersistenceConfig, PersistenceStrategy, RaftLog,
+    PersistenceConfig, RaftLog,
 };
 use d_engine_proto::common::{Entry, EntryPayload};
 
@@ -47,26 +47,18 @@ async fn test_reset_performance_during_active_flush() {
     let max_reset_duration_ms = FLUSH_DELAY_MS * 3; // 600ms: accounts for IO thread overhead
 
     let test_cases = vec![
-        (
-            PersistenceStrategy::MemFirst,
-            FlushPolicy::Batch {
-                idle_flush_interval_ms: 1000,
-            },
-        ),
-        (
-            PersistenceStrategy::MemFirst,
-            FlushPolicy::Batch {
-                idle_flush_interval_ms: 1,
-            },
-        ),
+        FlushPolicy::Batch {
+            idle_flush_interval_ms: 1000,
+        },
+        FlushPolicy::Batch {
+            idle_flush_interval_ms: 1,
+        },
     ];
 
-    for (strategy, flush_policy) in test_cases {
+    for flush_policy in test_cases {
         let storage = create_delayed_storage(FLUSH_DELAY_MS);
         let config = PersistenceConfig {
-            strategy: strategy.clone(),
             flush_policy: flush_policy.clone(),
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         };
 
@@ -100,9 +92,8 @@ async fn test_reset_performance_during_active_flush() {
 
         assert!(
             duration.as_millis() < max_reset_duration_ms as u128,
-            "Reset took {}ms during active flush ({:?}/{:?})",
+            "Reset took {}ms during active flush ({:?})",
             duration.as_millis(),
-            strategy,
             flush_policy
         );
     }
@@ -124,11 +115,9 @@ async fn test_filter_conflicts_performance_during_flush() {
     for (idle_flush_interval_ms, max_duration_ms) in test_cases {
         let storage = create_delayed_storage(FLUSH_DELAY_MS);
         let config = PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         };
 
@@ -190,21 +179,15 @@ async fn test_fresh_cluster_performance_consistency() {
     let max_duration_ms = if is_ci { 50 } else { 5 };
 
     let test_cases = vec![
-        (
-            PersistenceStrategy::MemFirst,
-            FlushPolicy::Batch {
-                idle_flush_interval_ms: 1000,
-            },
-        ),
-        (
-            PersistenceStrategy::MemFirst,
-            FlushPolicy::Batch {
-                idle_flush_interval_ms: 1,
-            },
-        ),
+        FlushPolicy::Batch {
+            idle_flush_interval_ms: 1000,
+        },
+        FlushPolicy::Batch {
+            idle_flush_interval_ms: 1,
+        },
     ];
 
-    for (strategy, flush_policy) in test_cases {
+    for flush_policy in test_cases {
         let mut log_store = MockLogStore::new();
         log_store.expect_is_write_durable().returning(|| true);
         log_store.expect_flush().return_once(|| Ok(()));
@@ -215,9 +198,7 @@ async fn test_fresh_cluster_performance_consistency() {
         log_store.expect_reset().returning(|| Ok(()));
 
         let config = PersistenceConfig {
-            strategy: strategy.clone(),
             flush_policy: flush_policy.clone(),
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         };
 
@@ -235,9 +216,8 @@ async fn test_fresh_cluster_performance_consistency() {
 
         assert!(
             duration.as_millis() < max_duration_ms as u128,
-            "Fresh cluster reset took {}ms ({:?}/{:?})",
+            "Fresh cluster reset took {}ms ({:?})",
             duration.as_millis(),
-            strategy,
             flush_policy
         );
     }

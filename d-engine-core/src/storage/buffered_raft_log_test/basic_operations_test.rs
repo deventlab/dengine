@@ -13,7 +13,7 @@ use crate::test_utils::{
     BufferedRaftLogTestContext, mock_empty_entries, simulate_delete_command,
     simulate_insert_command,
 };
-use crate::{FlushPolicy, PersistenceStrategy, RaftLog};
+use crate::{FlushPolicy, RaftLog};
 
 /// Test get_entries_range returns correct subset
 ///
@@ -24,7 +24,6 @@ use crate::{FlushPolicy, PersistenceStrategy, RaftLog};
 #[tokio::test]
 async fn test_get_entries_range_returns_correct_subset() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -52,7 +51,6 @@ async fn test_get_entries_range_returns_correct_subset() {
 #[tokio::test]
 async fn test_get_entries_range_handles_large_range() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -86,7 +84,6 @@ async fn test_get_entries_range_handles_large_range() {
 #[tokio::test]
 async fn test_filter_conflicts_removes_entries_with_different_term() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -133,7 +130,6 @@ async fn test_filter_conflicts_removes_entries_with_different_term() {
 #[tokio::test]
 async fn test_filter_conflicts_handles_multiple_scenarios() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -193,7 +189,6 @@ async fn test_filter_conflicts_handles_multiple_scenarios() {
 #[tokio::test]
 async fn test_last_entry_returns_highest_index() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -218,7 +213,6 @@ async fn test_last_entry_returns_highest_index() {
 #[tokio::test]
 async fn test_last_entry_matches_buffer_length() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -247,7 +241,6 @@ async fn test_last_entry_matches_buffer_length() {
 #[tokio::test]
 async fn test_last_entry_with_large_payload_id() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -272,7 +265,6 @@ async fn test_last_entry_with_large_payload_id() {
 #[tokio::test]
 async fn test_insert_batch_appends_entries_in_order() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -305,7 +297,6 @@ async fn test_insert_batch_appends_entries_in_order() {
 #[tokio::test]
 async fn test_get_entries_range_multiple_bounds() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -360,7 +351,6 @@ async fn test_get_entries_range_multiple_bounds() {
 #[tokio::test]
 async fn test_insert_duplicate_commands_as_separate_events() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -395,7 +385,6 @@ async fn test_insert_duplicate_commands_as_separate_events() {
 #[tokio::test]
 async fn test_purge_after_insert_maintains_consistency() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -428,7 +417,6 @@ async fn test_purge_after_insert_maintains_consistency() {
 #[tokio::test]
 async fn test_purge_logs_removes_entries_up_to_index() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -476,7 +464,6 @@ async fn test_purge_logs_removes_entries_up_to_index() {
 #[tokio::test]
 async fn test_concurrent_purge_operations_are_safe() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -515,7 +502,6 @@ async fn test_concurrent_purge_operations_are_safe() {
 #[tokio::test]
 async fn test_first_entry_id_after_purge_updates() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -547,7 +533,6 @@ async fn test_first_entry_id_after_purge_updates() {
 #[tokio::test]
 async fn test_single_entry_insert_succeeds() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -569,7 +554,6 @@ async fn test_single_entry_insert_succeeds() {
 #[tokio::test]
 async fn test_is_empty_returns_true_for_new_log() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -588,7 +572,6 @@ async fn test_is_empty_returns_true_for_new_log() {
 #[tokio::test]
 async fn test_is_empty_returns_false_after_append() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -613,7 +596,6 @@ async fn test_is_empty_returns_false_after_append() {
 #[tokio::test]
 async fn test_last_log_id_for_empty_log() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -636,7 +618,6 @@ async fn test_last_log_id_for_empty_log() {
 #[tokio::test]
 async fn test_last_log_id_after_appends() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -662,7 +643,6 @@ async fn test_last_log_id_after_appends() {
 #[tokio::test]
 async fn test_drop_shuts_down_workers_gracefully() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -686,14 +666,12 @@ async fn test_drop_shuts_down_workers_gracefully() {
 #[tokio::test]
 async fn test_same_index_and_term_implies_identical_prefix() {
     let ctx1 = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
         "test_log_matching_1",
     );
     let ctx2 = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -726,7 +704,6 @@ async fn test_same_index_and_term_implies_identical_prefix() {
 #[tokio::test]
 async fn test_committed_entry_present_in_future_leaders() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -758,7 +735,6 @@ async fn test_committed_entry_present_in_future_leaders() {
 #[tokio::test]
 async fn test_append_updates_last_entry() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -784,7 +760,6 @@ async fn test_append_updates_last_entry() {
 #[tokio::test]
 async fn test_insert_batch_with_empty_list() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -807,7 +782,6 @@ async fn test_insert_batch_with_empty_list() {
 #[tokio::test]
 async fn test_insert_batch_updates_metadata() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },

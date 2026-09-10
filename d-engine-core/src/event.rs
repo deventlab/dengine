@@ -71,6 +71,11 @@ pub enum InternalEvent {
         durable_index: u64,
     },
 
+    /// Raw fsync-completion mark — NOT yet validated. Consumer must call
+    /// `raft_log().try_advance_durable_index(mark)`, which re-checks the entry's
+    /// term before advancing `durable_index`.
+    FsyncCompleted(LogId),
+
     /// AppendEntries result from a per-follower ReplicationWorker back to the Raft loop.
     /// Leader processes this in handle_append_result: updates match_index, re-calculates commit,
     /// and drains pending_client_writes when quorum is achieved.

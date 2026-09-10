@@ -16,11 +16,7 @@ max_drain = 1024
 max_batch_size = 200
 
 [raft.persistence]
-strategy = "MemFirst"
 flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
-# Maximum number of log entries to buffer in memory
-# when using async persistence strategies (MemFirst/Batched)
-max_buffered_entries = 10000
 
 [raft.metrics]
 enable_backpressure = false

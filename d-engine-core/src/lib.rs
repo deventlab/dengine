@@ -173,6 +173,11 @@ pub(crate) fn if_higher_term_found(
 /// entries in the  logs. If the logs have last entries with different terms, then the log with the
 /// later term is more up-to-date. If the logs end with the same term, then whichever log is longer
 /// is more up-to-date.
+///
+/// #446: callers must pass the in-memory last-log-id (last_entry_id), never durable_index.
+/// A node with an un-fsynced tail must still be able to reject a candidate whose log is
+/// genuinely less up to date — voting eligibility and commit-durability are separate
+/// concerns and must not share the same index source.
 pub(crate) fn is_target_log_more_recent(
     my_last_log_index: u64,
     my_last_log_term: u64,

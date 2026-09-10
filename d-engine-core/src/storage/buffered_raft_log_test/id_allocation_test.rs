@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::{
-    BufferedRaftLog, FlushPolicy, MockStorageEngine, MockTypeConfig, PersistenceConfig,
-    PersistenceStrategy, RaftLog,
+    BufferedRaftLog, FlushPolicy, MockStorageEngine, MockTypeConfig, PersistenceConfig, RaftLog,
 };
 
 fn setup_memory() -> Arc<BufferedRaftLog<MockTypeConfig>> {
@@ -20,11 +19,9 @@ fn setup_memory() -> Arc<BufferedRaftLog<MockTypeConfig>> {
     let (raft_log, _receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 1,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,

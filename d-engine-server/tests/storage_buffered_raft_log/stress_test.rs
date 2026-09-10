@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use d_engine_core::{FlushPolicy, LogStore, PersistenceStrategy, RaftLog, StorageEngine};
+use d_engine_core::{FlushPolicy, LogStore, RaftLog, StorageEngine};
 use d_engine_proto::common::{Entry, EntryPayload};
 use futures::future::join_all;
 use tokio::time::Instant;
@@ -22,8 +22,7 @@ use super::TestContext;
 
 #[tokio::test]
 async fn test_high_concurrency() {
-    let ctx = TestContext::new(
-        PersistenceStrategy::MemFirst,
+    let mut ctx = TestContext::new(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -53,6 +52,7 @@ async fn test_high_concurrency() {
 
     // With MemFirst, entries are buffered; wait for all to be durable before asserting.
     ctx.raft_log.flush().await.unwrap();
+    ctx.drain_fsync_completions();
 
     // Verify all entries persisted
     assert_eq!(ctx.raft_log.durable_index(), 1000);
@@ -63,7 +63,6 @@ async fn test_high_concurrency() {
 #[traced_test]
 async fn test_high_concurrency_mixed_operations() {
     let ctx = TestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 100,
         },
@@ -123,8 +122,15 @@ async fn test_high_concurrency_mixed_operations() {
 
     // Verify data integrity
     assert_eq!(ctx.raft_log.len(), 10000);
+    // append_entries() now round-trips through a dedicated IO thread via
+    // oneshot (see #444: leader's own write must reach the storage engine
+    // before counting toward quorum) — an intentional correctness/speed
+    // tradeoff, not a regression. The old 10s bound predates that fix;
+    // observed wall-clock for this test's 10k concurrent writes is now
+    // 13-18s depending on machine load. New bound leaves real headroom
+    // above that range rather than chasing the exact number.
     assert!(
-        duration < Duration::from_secs(10),
+        duration < Duration::from_secs(30),
         "Operations took too long: {duration:?}"
     );
 }
@@ -135,7 +141,6 @@ mod mem_first_tests {
     #[tokio::test]
     async fn test_basic_write_before_persist() {
         let ctx = TestContext::new(
-            PersistenceStrategy::MemFirst,
             FlushPolicy::Batch {
                 idle_flush_interval_ms: 1,
             },
@@ -150,8 +155,7 @@ mod mem_first_tests {
 
     #[tokio::test]
     async fn test_async_persistence() {
-        let ctx = TestContext::new(
-            PersistenceStrategy::MemFirst,
+        let mut ctx = TestContext::new(
             FlushPolicy::Batch {
                 idle_flush_interval_ms: 1,
             },
@@ -161,6 +165,7 @@ mod mem_first_tests {
 
         // Trigger flush
         ctx.raft_log.flush().await.unwrap();
+        ctx.drain_fsync_completions();
 
         // Verify persistence
         assert_eq!(ctx.raft_log.durable_index(), 100);
@@ -170,7 +175,6 @@ mod mem_first_tests {
     #[tokio::test]
     async fn test_power_loss_data_loss() {
         let ctx = TestContext::new(
-            PersistenceStrategy::MemFirst,
             FlushPolicy::Batch {
                 idle_flush_interval_ms: 1,
             },
@@ -188,7 +192,6 @@ mod mem_first_tests {
     #[tokio::test]
     async fn test_high_concurrency_memory_only() {
         let ctx = TestContext::new(
-            PersistenceStrategy::MemFirst,
             FlushPolicy::Batch {
                 idle_flush_interval_ms: 1,
             },
@@ -225,7 +228,6 @@ mod mem_first_tests {
 #[tokio::test]
 async fn test_term_index_correctness_under_load() {
     let ctx = TestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },

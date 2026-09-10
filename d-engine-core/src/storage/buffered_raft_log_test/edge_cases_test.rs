@@ -1,14 +1,13 @@
 use bytes::Bytes;
 
+use crate::FlushPolicy;
 use crate::storage::raft_log::RaftLog;
 use crate::test_utils::BufferedRaftLogTestContext;
-use crate::{FlushPolicy, PersistenceStrategy};
 use d_engine_proto::common::{Entry, EntryPayload, LogId};
 
 #[tokio::test]
 async fn test_empty_log_operations() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -27,7 +26,6 @@ async fn test_empty_log_operations() {
 #[tokio::test]
 async fn test_single_entry_operations() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -56,7 +54,6 @@ async fn test_single_entry_operations() {
 #[tokio::test]
 async fn test_gap_handling_in_indexes() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -99,7 +96,6 @@ async fn test_gap_handling_in_indexes() {
 #[tokio::test]
 async fn test_extreme_boundary_conditions() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },

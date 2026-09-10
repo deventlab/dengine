@@ -6,7 +6,6 @@ use crate::Node;
 use crate::proto_convert;
 use d_engine_core::InboundEvent;
 use d_engine_core::MaybeCloneOneshot;
-use d_engine_core::MaybeCloneOneshotReceiver;
 use d_engine_core::RaftOneshot;
 use d_engine_core::TypeConfig;
 #[cfg(feature = "watch")]
@@ -136,12 +135,24 @@ where
         Pin<Box<dyn Stream<Item = Result<AppendEntriesResponse, Status>> + Send>>;
 
     /// Processes a persistent bidirectional AppendEntries stream from the cluster leader.
+    /// #446: responses are forwarded as soon as each one is ready, not in strict arrival
+    /// order — leader-side match_index/next_index updates are already designed to
+    /// tolerate out-of-order pipeline responses (`leader_state.rs`, "only advance,
+    /// never retreat"), so nothing downstream needs strict ordering. Strict FIFO would
+    /// let one response still waiting on this node's own durable_index (RPO=0) block
+    /// every later, already-ready response on the same connection — including
+    /// unrelated ones like heartbeats.
     ///
-    /// Decouples request ingestion from response emission:
-    /// - recv task: reads batches from the stream, dispatches each as a `InboundEvent::AppendEntries`
-    ///   (non-blocking between batches)
-    /// - forwarder task: drains ordered response handles sequentially; ordering is guaranteed
-    ///   by the Raft single-threaded event loop
+    /// Single task, bounded concurrency: reads a new request only while fewer than
+    ///  `max_pending_append_responses` requests are still in flight, so a stalled fsync
+    /// bounds memory/task growth instead of growing without limit.
+    ///
+    /// Known tradeoff, not an oversight: this is a single task, so a slow/stuck
+    /// network write (`out_tx.send().await` blocking because the peer isn't reading)
+    /// also delays reading new requests AND processing the shutdown signal, until the
+    /// write unblocks or the connection dies. Accepted deliberately — if the peer
+    /// isn't reading responses, there's no useful work to do by reading more requests
+    /// either; this is legitimate backpressure, not a bug.
     async fn stream_append_entries(
         &self,
         request: tonic::Request<tonic::Streaming<AppendEntriesRequest>>,
@@ -157,30 +168,31 @@ where
 
         let mut in_stream = request.into_inner();
         let event_tx = self.event_tx.clone();
-        let ordered_channel_capacity = self.node_config.raft.ordered_channel_capacity;
+        let max_pending = self.node_config.raft.max_pending_append_responses;
         let mut shutdown = self.shutdown_signal.clone();
+        let node_id = self.node_id;
 
-        // Output: ordered ACKs sent back to the leader over the bidi stream
-        let (out_tx, out_rx) = mpsc::channel::<Result<AppendEntriesResponse, Status>>(128);
+        // Output: ACKs sent back to the leader over the bidi stream, in completion order.
+        // Capacity matches max_pending — completed responses can never outnumber
+        // in-flight requests, so there's no separate number to reason about here.
+        let (out_tx, out_rx) = mpsc::channel::<Result<AppendEntriesResponse, Status>>(max_pending);
 
-        // Ordered queue: response oneshot receivers in FIFO arrival order
-        let (ordered_tx, mut ordered_rx) = mpsc::channel::<
-            MaybeCloneOneshotReceiver<Result<AppendEntriesResponse, Status>>,
-        >(ordered_channel_capacity);
-
-        // Recv task: read batches, dispatch to Raft loop without waiting for each ACK.
-        // Selects on shutdown signal so the task exits immediately on node stop, rather
-        // than waiting for the next message from the leader. This unblocks serve_with_shutdown
-        // and allows Arc<Node> (and Arc<DB>) to be released promptly after stop().
+        // Single task: read requests, dispatch to the Raft loop, and forward whichever
+        // response becomes ready first — bounded by `max_pending` in-flight responses.
         tokio::spawn(async move {
             use futures::StreamExt;
+            use futures::stream::FuturesUnordered;
+
+            let mut pending = FuturesUnordered::new();
+            let mut inbound_open = true;
+
             loop {
                 tokio::select! {
                     biased;
                     _ = shutdown.changed() => {
                         break;
                     }
-                    result = in_stream.next() => {
+                    result = in_stream.next(), if inbound_open && pending.len() < max_pending => {
                         match result {
                             Some(Ok(req)) => {
                                 let (resp_tx, resp_rx) = MaybeCloneOneshot::new();
@@ -188,32 +200,51 @@ where
                                     debug!("[stream_append_entries|recv] event_tx closed");
                                     break;
                                 }
-                                if ordered_tx.send(resp_rx).await.is_err() {
-                                    break;
-                                }
+                                pending.push(async move {
+                                    match resp_rx.await {
+                                        Ok(Ok(resp)) => Ok(resp),
+                                        Ok(Err(status)) => Err(status),
+                                        Err(_) => Err(Status::internal("Response channel closed")),
+                                    }
+                                });
                             }
                             Some(Err(e)) => {
                                 // Debug: expected when the peer goes away (crash/restart/shutdown), self-heals.
                                 debug!("[stream_append_entries|recv] stream error: {:?}", e);
-                                break;
+                                 inbound_open = false;
                             }
-                            None => break,
+                            None => inbound_open = false,
                         }
                     }
-                }
-            }
-        });
-
-        // Forwarder task: drain ordered queue sequentially (FIFO guaranteed by Raft loop)
-        tokio::spawn(async move {
-            while let Some(resp_rx) = ordered_rx.recv().await {
-                let result = match resp_rx.await {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(status)) => Err(status),
-                    Err(_) => Err(Status::internal("Response channel closed")),
-                };
-                if out_tx.send(result).await.is_err() {
-                    break;
+                    Some(result) = pending.next(), if !pending.is_empty() => {
+                        // Observability only — behavior doesn't change, the send still
+                        // runs to completion normally. If the peer isn't reading (network
+                        // stall, dead connection with the TCP timeout not yet fired), this
+                        // surfaces it instead of silently blocking with zero signal.
+                        let mut send_fut = std::pin::pin!(out_tx.send(result));
+                        let mut stuck_logged = false;
+                        let closed = loop {
+                            tokio::select! {
+                                res = &mut send_fut => break res.is_err(),
+                                _ = tokio::time::sleep(Duration::from_secs(5)), if !stuck_logged => {
+                                    stuck_logged = true;
+                                    error!(
+                                        node_id,
+                                        "stream_append_entries forwarder stuck sending a \
+                                         response for >5s — peer may not be reading \
+                                         (network stall or dead connection)"
+                                    );
+                                    metrics::counter!(
+                                        "server.grpc.stream_append_entries.forwarder_stuck"
+                                    )
+                                    .increment(1);
+                                }
+                            }
+                        };
+                        if closed {
+                            break;
+                        }
+                    }
                 }
             }
         });

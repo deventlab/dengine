@@ -17,7 +17,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let log_dir = env::var("LOG_DIR")
         .map_err(|_| "LOG_DIR environment variable not set")
@@ -58,8 +58,11 @@ async fn main() {
     let (graceful_tx, graceful_rx) = watch::channel(());
 
     // Start the server (wait for its initialization to complete)
-    let server_handler =
-        tokio::spawn(start_dengine_server(data_dir, config_path, graceful_rx.clone()));
+    let server_handler = tokio::spawn(start_dengine_server(
+        data_dir,
+        config_path,
+        graceful_rx.clone(),
+    ));
 
     // Wait for the server to initialize (adjust the waiting time according to the actual logic)
     tokio::time::sleep(Duration::from_secs(1)).await;

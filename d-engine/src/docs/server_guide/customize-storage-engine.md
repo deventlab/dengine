@@ -91,7 +91,7 @@ impl StorageEngine for CustomStorageEngine {
 - **Consistency**: Maintain exactly-once semantics for log entries
 - **Performance**: Target >100k ops/sec for log persistence. Do not call `fsync` inside
   `persist_entries()`—the framework batches entries and calls `flush()` once per batch
-  (`MemFirst + FlushPolicy::Batch`), which amortises the `fsync` cost across many entries.
+  (`FlushPolicy::Batch`), which amortises the `fsync` cost across many entries.
 - **Resource Management**: Clean up resources in `Drop` implementation
 
 ## 3. StorageEngine API Reference

@@ -1344,17 +1344,10 @@ impl<T: TypeConfig> RaftRoleState for LeaderState<T> {
         internal_event_tx: &mpsc::UnboundedSender<InternalEvent>,
     ) {
         let new_commit_index = if self.cluster_metadata.single_voter {
-            // MemFirst single-voter: LogFlushed(durable) is the IO checkpoint.
-            // Commit to last_entry_id() — not just durable — to allow pipelining
-            // across IO batch boundaries. Matches multi-voter MemFirst where leader
-            // contributes last_entry_id() to quorum (not durable_index).
-            let last_log_index = ctx.raft_log().last_entry_id();
-            debug_assert!(
-                last_log_index >= durable,
-                "last_entry_id ({last_log_index}) must be >= durable ({durable})"
-            );
-            if last_log_index > self.commit_index() {
-                Some(last_log_index)
+            // RPO=0 (#446): single-voter has no majority to fall back on — commit
+            // must not advance past what this node has itself fsynced.
+            if durable > self.commit_index() {
+                Some(durable)
             } else {
                 None
             }

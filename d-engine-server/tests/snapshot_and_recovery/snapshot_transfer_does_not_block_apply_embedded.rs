@@ -91,8 +91,19 @@ async fn test_snapshot_transfer_does_not_block_apply() -> Result<(), Box<dyn std
     // the leader's own purge log lets the test wait for the real boundary instead of
     // guessing from file existence.
     let logs = capture_logs_globally_filtered(
-        "info,d_engine_core=debug,d_engine_server=debug,h2=off,tonic=warn,hyper=warn",
+        "info,d_engine_core=debug,d_engine_core::state_machine_handler=trace,d_engine_server=debug,h2=off,tonic=warn,hyper=warn",
     );
+
+    // Recorded before any baseline writes start, not after. Snapshot capture + purge for
+    // entry 64 runs as a background task, fully concurrent with the remaining baseline
+    // writes (65..80) — it does not wait for the write loop below to finish. Verified by
+    // log inspection: `purge_upto_index=` was observed appearing while the write loop was
+    // still around entry ~74, well before `commit_index` reached 80. Placing `since` after
+    // the write loop (as before) raced against that background completion: if purge won
+    // the race, its log line landed before `since` and the poll below could never see it,
+    // failing the test even though purge genuinely happened. Placing `since` here, before
+    // any write can possibly trigger a purge, removes the race regardless of which side wins.
+    let since = logs.lock().unwrap().len();
 
     const SNAPSHOT_THRESHOLD: u64 = 64;
     const RETAINED_LOGS: u64 = 8;
@@ -180,11 +191,6 @@ push_queue_size = 1
             .await?;
     }
 
-    // Recorded here (right after the baseline writes, not at test start): with
-    // SNAPSHOT_THRESHOLD=64 > RETAINED_LOGS=8 (checked below), no node's log can cross a
-    // purge boundary before these writes land, so nothing earlier in the buffer can
-    // satisfy the match below — no extra gate is needed to make `since` safe.
-    //
     // This used to gate `since` on a `wait_for_snapshot` directory scan for the leader's
     // `.gz` file first, on the theory that "file exists" proves the snapshot is built.
     // It doesn't: `compress_directory` (default_state_machine_handler.rs) calls
@@ -196,7 +202,6 @@ push_queue_size = 1
     // made this test flake under CI load: RocksDB checkpoint export + tar/gzip
     // compression + metadata persist is genuinely sequential disk+CPU work that slows
     // down under contention.
-    let since = logs.lock().unwrap().len();
 
     // The retained-log purge boundary — the actual signal this test needs, not just "a
     // snapshot file exists" (see comment above for why those differ). Emitted by
@@ -208,13 +213,28 @@ push_queue_size = 1
     // SNAPSHOT_THRESHOLD=64 > RETAINED_LOGS=8, the earliest possible snapshot on this
     // cluster already has last_included.index >= 64, so purge_upto_index is always > 0
     // by the time this log line can appear at all.
+    // 60 x 500ms = 30s, not 15s: this test lives in the `multi-node-cluster-local`
+    // nextest group (throttled but not serialized, see .config/nextest.toml), and the
+    // log line polled below shares a process-global Mutex<Vec<String>> with every other
+    // concurrently-running test in this binary (see log_capture.rs). Under full-suite
+    // load, RocksDB checkpoint export + tar/gzip (genuinely sequential CPU+disk work,
+    // see comment above) plus that shared-mutex contention can push real completion past
+    // 15s even though nothing is actually wrong — same root cause already documented in
+    // stress_test.rs's 30s bound.
     let mut purged = false;
-    for _ in 0..30 {
+    for _ in 0..60 {
         if logs_contain_globally_since(&logs, since, "purge_upto_index=") {
             purged = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !purged {
+        eprintln!("=== DEBUG: captured logs since baseline writes ===");
+        for line in logs.lock().unwrap()[since..].iter() {
+            eprintln!("{line}");
+        }
+        eprintln!("=== END DEBUG ===");
     }
     assert!(
         purged,

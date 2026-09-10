@@ -383,7 +383,7 @@ impl LogStore for RocksDBLogStore {
         &self,
         from_index: u64,
         new_entries: Vec<Entry>,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let cf = self
             .db
             .cf_handle(LOG_CF)
@@ -404,7 +404,7 @@ impl LogStore for RocksDBLogStore {
 
         self.db.write(&batch).map_err(|e| StorageError::DbError(e.to_string()))?;
         self.last_index.store(new_last_index, Ordering::SeqCst);
-        Ok(())
+        Ok(new_last_index)
     }
 
     fn is_write_durable(&self) -> bool {

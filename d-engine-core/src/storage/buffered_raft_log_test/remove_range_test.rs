@@ -1,8 +1,8 @@
 use d_engine_proto::common::{Entry, LogId};
 
+use crate::FlushPolicy;
 use crate::storage::raft_log::RaftLog;
 use crate::test_utils::{BufferedRaftLogTestContext, simulate_insert_command};
-use crate::{FlushPolicy, PersistenceStrategy};
 
 fn entry(
     index: u64,
@@ -18,7 +18,6 @@ fn entry(
 #[tokio::test]
 async fn test_remove_middle_range() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -50,7 +49,6 @@ async fn test_remove_middle_range() {
 #[tokio::test]
 async fn test_remove_from_start() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -77,7 +75,6 @@ async fn test_remove_from_start() {
 #[tokio::test]
 async fn test_remove_to_end() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -105,7 +102,6 @@ async fn test_remove_to_end() {
 #[tokio::test]
 async fn test_remove_empty_range() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -126,7 +122,6 @@ async fn test_remove_empty_range() {
 #[tokio::test]
 async fn test_remove_entire_log() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -150,7 +145,6 @@ async fn test_remove_entire_log() {
 #[tokio::test]
 async fn test_remove_single_entry() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -185,7 +179,6 @@ async fn test_remove_single_entry() {
 #[tokio::test]
 async fn test_remove_range_clears_term_indexes_for_removed_entries() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -252,7 +245,6 @@ async fn test_remove_range_clears_term_indexes_for_removed_entries() {
 #[tokio::test]
 async fn test_purge_prefix_removes_entries_and_records_boundary_together() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -301,7 +293,6 @@ async fn test_purge_prefix_removes_entries_and_records_boundary_together() {
 #[tokio::test]
 async fn test_purge_prefix_multi_term_cutoff_updates_term_indexes_and_boundary() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },

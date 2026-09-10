@@ -6,16 +6,12 @@ use tokio::sync::mpsc;
 
 use crate::storage::raft_log::RaftLog;
 use crate::test_utils::{BufferedRaftLogTestContext, MockStorageEngine, simulate_insert_command};
-use crate::{
-    BufferedRaftLog, FlushPolicy, InternalEvent, MockTypeConfig, PersistenceConfig,
-    PersistenceStrategy,
-};
+use crate::{BufferedRaftLog, FlushPolicy, InternalEvent, MockTypeConfig, PersistenceConfig};
 use d_engine_proto::common::{Entry, LogId};
 
 #[tokio::test]
 async fn test_durable_index_monotonic_under_concurrency() {
-    let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
+    let mut ctx = BufferedRaftLogTestContext::new(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -43,6 +39,7 @@ async fn test_durable_index_monotonic_under_concurrency() {
 
     // Wait for flush to complete
     tokio::time::sleep(Duration::from_millis(200)).await;
+    ctx.drain_fsync_completions();
 
     // Verify monotonicity
     let durable = ctx.raft_log.durable_index();
@@ -55,7 +52,6 @@ async fn test_durable_index_monotonic_under_concurrency() {
 #[tokio::test]
 async fn test_durable_index_with_non_contiguous_entries() {
     let ctx = BufferedRaftLogTestContext::new(
-        PersistenceStrategy::MemFirst,
         FlushPolicy::Batch {
             idle_flush_interval_ms: 1,
         },
@@ -126,11 +122,9 @@ async fn test_purge_does_not_regress_durable_index_already_ahead() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -141,6 +135,7 @@ async fn test_purge_does_not_regress_durable_index_already_ahead() {
     // Arrange: entries 1..=100, all flushed — durable_index reaches 100 and
     // fires LogFlushed(100).
     simulate_insert_command(&raft_log, (1..=100).collect(), 1).await;
+    crate::test_utils::drain_and_apply_fsync_completions(&raft_log, &mut log_flush_rx);
     assert_eq!(raft_log.durable_index(), 100);
 
     // Drain the LogFlushed(100) from the insert+flush above — not what this

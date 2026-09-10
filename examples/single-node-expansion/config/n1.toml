@@ -14,6 +14,8 @@ initial_cluster = [
 
 [raft]
 general_raft_timeout_duration_in_ms = 100
+cmd_channel_capacity = 1024
+max_pending_append_responses = 1024
 
 [raft.election]
 election_timeout_min = 1000
@@ -23,27 +25,49 @@ election_timeout_max = 2000
 default_policy = "LeaseRead"
 lease_duration_ms = 500
 
+[raft.read_actor]
+channel_capacity = 10240
+max_drain = 2000
+
+[raft.batching]
+# Maximum number of commands to accumulate in a single batch during drain operations
+max_batch_size = 200
+
+[raft.metrics]
+enable_backpressure = false
+enable_batch = false
+
+[raft.backpressure]
+max_pending_writes = 1000
+max_pending_reads = 500
+
+
 [raft.persistence]
-strategy = "MemFirst"
-flush_policy = { Batch = { idle_flush_interval_ms = 20 } }
-max_buffered_entries = 10000
+flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
 
 [raft.snapshot]
-enable = false
-max_log_entries_before_snapshot = 10000
-retained_log_entries = 3
+enable = true
+max_log_entries_before_snapshot = 5000
+retained_log_entries = 100
+cleanup_retain_count = 100
 
-# == Network Control Plane ==
+# == TTL Lease Configuration ==
+[raft.state_machine.lease]
+cleanup_interval_ms = 1000
+max_cleanup_duration_ms = 1
+
+# == Network Control Plane (voting, heartbeat, etc.) ==
 [network.control]
 connection_window_size = 4_194_304
 stream_window_size = 2_097_152
 
 tcp_keepalive_in_secs = 60
-http2_keep_alive_interval_in_secs = 15
-http2_keep_alive_timeout_in_secs = 10
+http2_keep_alive_interval_in_secs = 15  # Slightly increase to reduce frequent keep-alives
+http2_keep_alive_timeout_in_secs = 10   # Increase timeout
 
+# New performance tuning parameters
 
-# == Network Data Plane ==
+# == Network Data Plane (append_entries, etc.) ==
 [network.data]
 connect_timeout_in_ms = 100
 request_timeout_in_ms = 300
@@ -51,13 +75,16 @@ connection_window_size = 8_388_608
 stream_window_size = 4_194_304
 
 tcp_keepalive_in_secs = 60
-http2_keep_alive_interval_in_secs = 15
+http2_keep_alive_interval_in_secs = 15  # Same as control plane
 http2_keep_alive_timeout_in_secs = 10
 
-
+# New data plane optimizations
 
 # == Server Transport (single listener serving every RPC type) ==
 [network.server]
 concurrency_limit_per_connection = 100  # Increased for higher concurrent replication load
 max_concurrent_streams = 4096           # Increased to reduce stream creation overhead
 max_pending_accept_reset_streams = 2000 # Higher pending stream limit for Rapid Reset mitigation
+
+[storage]
+unified_db = false

@@ -1,3 +1,5 @@
 **/target/
 .git/
-examples/
+examples/*
+!examples/three-nodes-standalone
+!examples/client-usage-standalone

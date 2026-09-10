@@ -32,6 +32,18 @@ All notable changes to this project will be documented in this file.
   returns immediately, and entries arriving during an in-flight fsync are coalesced into the same physical
   disk flush. Storage-level group commit is restored without artificial batching windows.
 
+- **🛑 Client-acknowledged writes could be lost on correlated power loss (#446)**: Raft commit quorum
+  counted the leader's own log contribution using its in-memory tail (`last_entry_id()`), not its
+  fsync-confirmed position (`durable_index()`) — a write could reach a majority-looking commit index,
+  and be acknowledged to the client, before enough replicas had actually synced it to disk. If those
+  nodes then lost power before their next fsync, the acknowledged write was gone. Fixed: leader quorum
+  calculation, follower `AppendEntries` ACK timing (a follower now withholds its response until its own
+  `durable_index` reaches the acknowledged entry), and single-voter clusters (previously exempted from
+  this class of fix, see #329) all gate on `durable_index`. RPO=0 for acknowledged writes is now a
+  mandatory invariant. Net effect: write acknowledgment latency now includes fsync time on a quorum of
+  replicas — see [Throughput Optimization Guide](./d-engine/src/docs/performance/throughput-optimization-guide.md)
+  for tuning `idle_flush_interval_ms`.
+
 ### Changed
 
 - **MSRV raised to Rust 1.89**: The `data_dir` startup lock (prevents two node processes from
@@ -64,6 +76,17 @@ All notable changes to this project will be documented in this file.
 - **`snapshots_dir` is no longer configurable** — always `data_dir/snapshots`. Fixes cross-node snapshot corruption when running multiple nodes on one machine (was a shared `/tmp/snapshots`).
 
 - **`NodeBuilder` is no longer public** — use `EmbeddedEngine::start_custom`/`StandaloneEngine::run_custom` to plug in a custom storage engine or state machine. See [Migration Guide](./MIGRATION_GUIDE.md) for details.
+
+- **⚠️ `[raft] ordered_channel_capacity` renamed to `max_pending_append_responses`** (#446): Follows the
+  gRPC `AppendEntries` forwarder rewrite (`FuturesUnordered`-based, no longer strict-FIFO) that shipped
+  alongside the durability fix above. Old field name is silently ignored, not an error — update existing
+  configs to the new name to keep the setting in effect.
+
+- **⚠️ `[raft.persistence] strategy` removed** (#446): `PersistenceStrategy` was a single-variant enum
+  (`MemFirst`) left over from #268; its only meaning now lives in whether an entry has reached
+  `durable_index`, which is no longer a configurable choice. Existing configs setting `strategy =
+  "MemFirst"` or `"DiskFirst"` are silently ignored, not an error — remove the field, `flush_policy`
+  is the only persistence knob now.
 
 ---
 

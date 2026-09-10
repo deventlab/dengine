@@ -20,10 +20,11 @@ use crate::MockMetaStore;
 use crate::MockStorageEngine;
 use crate::MockTypeConfig;
 use crate::PersistenceConfig;
-use crate::PersistenceStrategy;
 use d_engine_proto::common::Entry;
 use d_engine_proto::common::LogId;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -39,7 +40,7 @@ use crate::{FlushPolicy, RaftLog};
 /// automatically — no explicit `flush()` required.
 #[tokio::test]
 async fn test_writes_become_durable_via_io_thread() {
-    let (ctx, flush_count) = BufferedRaftLogTestContext::new_not_durable(
+    let (mut ctx, flush_count) = BufferedRaftLogTestContext::new_not_durable(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 60_000,
         },
@@ -69,6 +70,7 @@ async fn test_writes_become_durable_via_io_thread() {
 
     // Give IO thread time to process write_notify wakeup and fsync.
     sleep(Duration::from_millis(50)).await;
+    ctx.drain_fsync_completions();
 
     // durable_index must have advanced via IO thread auto-fsync (no explicit flush).
     assert_eq!(
@@ -95,7 +97,7 @@ async fn test_writes_become_durable_via_io_thread() {
 /// N entries in one call → ≤2 fsyncs (not N), regardless of storage speed.
 #[tokio::test]
 async fn test_batch_append_produces_one_flush() {
-    let (ctx, flush_count) = BufferedRaftLogTestContext::new_not_durable(
+    let (mut ctx, flush_count) = BufferedRaftLogTestContext::new_not_durable(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 60_000,
         },
@@ -113,6 +115,7 @@ async fn test_batch_append_produces_one_flush() {
     ctx.raft_log.append_entries(entries).await.unwrap();
 
     ctx.raft_log.flush().await.unwrap();
+    ctx.drain_fsync_completions();
 
     assert_eq!(ctx.raft_log.durable_index(), 100);
 
@@ -135,7 +138,7 @@ async fn test_batch_append_produces_one_flush() {
 /// `else { pending_max = 0 }` branch is skipped.
 ///
 /// ## Original bug (fixed pre-#422)
-/// `handle_non_write_cmd(IOTask::Reset)` wiped the on-disk log but did NOT zero
+/// `run_storage_tasks(IOTask::Reset)` wiped the on-disk log but did NOT zero
 /// `pending_max`. On the next `write_notify` wakeup the IO thread would compute:
 /// ```
 /// pending_max = pending_max.max(new_end)   // stale 10 wins over new 3
@@ -156,12 +159,10 @@ async fn test_pending_max_zeroed_on_reset_preventing_durable_index_corruption() 
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             // Safety-net disabled: only write_notify triggers fsync.
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -221,7 +222,7 @@ async fn test_pending_max_zeroed_on_reset_preventing_durable_index_corruption() 
 /// flush() call must be durable when flush() returns, regardless of internal batching.
 #[tokio::test]
 async fn test_flush_is_strict_durability_barrier() {
-    let (ctx, _flush_count) = BufferedRaftLogTestContext::new_not_durable(
+    let (mut ctx, _flush_count) = BufferedRaftLogTestContext::new_not_durable(
         FlushPolicy::Batch {
             idle_flush_interval_ms: 60_000,
         },
@@ -240,6 +241,7 @@ async fn test_flush_is_strict_durability_barrier() {
             .unwrap();
     }
     ctx.raft_log.flush().await.unwrap();
+    ctx.drain_fsync_completions();
     assert_eq!(
         ctx.raft_log.durable_index(),
         20,
@@ -258,6 +260,7 @@ async fn test_flush_is_strict_durability_barrier() {
             .unwrap();
     }
     ctx.raft_log.flush().await.unwrap();
+    ctx.drain_fsync_completions();
     assert_eq!(
         ctx.raft_log.durable_index(),
         50,
@@ -288,11 +291,9 @@ async fn test_flush_propagates_io_error() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -350,11 +351,9 @@ async fn test_fsync_failure_poisons_and_rejects_writes_after_reset() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -407,11 +406,9 @@ async fn test_replace_range_failure_poisons() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -497,11 +494,9 @@ async fn test_purge_failure_poisons() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -547,11 +542,9 @@ async fn test_reset_failure_poisons() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -596,11 +589,9 @@ async fn test_save_hard_state_failure_poisons() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -645,11 +636,9 @@ async fn test_poisoned_rejects_save_hard_state() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -674,7 +663,7 @@ async fn test_poisoned_rejects_save_hard_state() {
 }
 
 // ============================================================================
-// Gap fix: handle_non_write_cmd now checks is_poisoned() before executing
+// Gap fix: run_storage_tasks now checks is_poisoned() before executing
 // ReplaceRange/Purge/Reset, instead of only checking it in run_batch_turn's
 // drain loop (which missed the direct-dispatch path in batch_processor's
 // top-level select, and the "just poisoned mid-turn" race).
@@ -693,11 +682,9 @@ async fn test_poisoned_skips_replace_range() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -775,11 +762,9 @@ async fn test_poisoned_does_not_skip_reset() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -816,11 +801,9 @@ async fn test_poisoned_skips_purge() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -828,6 +811,9 @@ async fn test_poisoned_skips_purge() {
     let raft_log = raft_log.start(receiver, None);
     std::thread::sleep(Duration::from_millis(10));
 
+    // advance_durable_and_notify() clamps against max_index — simulate a log
+    // that already has the entry this test purges up to.
+    raft_log.set_memory_max_index_for_test(1);
     raft_log.poisoned.store(true, Ordering::SeqCst);
 
     let result = raft_log.purge_logs_up_to(LogId { term: 1, index: 1 }).await;
@@ -843,13 +829,21 @@ async fn test_poisoned_skips_purge() {
 /// 2026-07-19 — `run_batch_turn`'s drain loop now replies before returning,
 /// instead of silently dropping the oneshot sender).
 ///
-/// Ordering is made deterministic (not timing-sensitive) by gating the IO
-/// thread inside its first `persist_entries()` call. While it's blocked, an
+/// Ordering is made deterministic (not timing-sensitive) by gating the base
+/// entries' `persist_entries()` call — `append_entries()` now calls it
+/// synchronously, so the base append is spawned as its own task and blocks
+/// there instead of returning immediately. While it's blocked, an
 /// `IOTask::Flush` is sent directly (guaranteed FIFO-first) followed by a
 /// conflict-triggering `filter_out_conflicts_and_append` call (sends
-/// `IOTask::ReplaceRange` second). Releasing the gate lets `run_batch_turn`
-/// drain both in one pass, in that order.
-#[tokio::test]
+/// `IOTask::ReplaceRange` second). Releasing the gate lets the base append
+/// finish and `run_batch_turn` drain both queued commands in one pass, in
+/// that order.
+///
+/// Needs `flavor = "multi_thread"`: the gate blocks on a synchronous
+/// `std::sync::mpsc::Receiver::recv()`, which would otherwise freeze the
+/// single default executor thread that the spawned base-append task, the
+/// conflict task, and this test body all need to share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_run_batch_turn_replace_range_failure_replies_err_to_queued_flush() {
     let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
     let gate_rx = std::sync::Mutex::new(Some(gate_rx));
@@ -888,11 +882,9 @@ async fn test_run_batch_turn_replace_range_failure_replies_err_to_queued_flush()
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
@@ -900,30 +892,34 @@ async fn test_run_batch_turn_replace_range_failure_replies_err_to_queued_flush()
     let raft_log = raft_log.start(receiver, None);
     std::thread::sleep(Duration::from_millis(10));
 
-    // Base entries land in memory synchronously; the IO thread wakes and
-    // immediately blocks inside the gated persist_entries() call, before it
-    // ever drains the command queue.
-    raft_log
-        .append_entries(vec![
-            Entry {
-                index: 1,
-                term: 1,
-                payload: None,
-            },
-            Entry {
-                index: 2,
-                term: 1,
-                payload: None,
-            },
-            Entry {
-                index: 3,
-                term: 1,
-                payload: None,
-            },
-        ])
-        .await
-        .unwrap();
-    sleep(Duration::from_millis(20)).await; // let the IO thread reach the gate
+    // Base entries land in memory synchronously (before the gate), then
+    // append_entries() blocks inside its own gated persist_entries() call —
+    // spawned so the rest of this test can proceed while it's stuck there.
+    let base_append_task = tokio::spawn({
+        let raft_log = raft_log.clone();
+        async move {
+            raft_log
+                .append_entries(vec![
+                    Entry {
+                        index: 1,
+                        term: 1,
+                        payload: None,
+                    },
+                    Entry {
+                        index: 2,
+                        term: 1,
+                        payload: None,
+                    },
+                    Entry {
+                        index: 3,
+                        term: 1,
+                        payload: None,
+                    },
+                ])
+                .await
+        }
+    });
+    sleep(Duration::from_millis(20)).await; // let it reach the gate
 
     // Send Flush directly — guarantees it's enqueued before the ReplaceRange
     // sent below, so it's the one already sitting in `replies` when the
@@ -954,6 +950,12 @@ async fn test_run_batch_turn_replace_range_failure_replies_err_to_queued_flush()
     });
     sleep(Duration::from_millis(50)).await; // let the ReplaceRange send land
     gate_tx.send(()).unwrap();
+
+    timeout(Duration::from_secs(2), base_append_task)
+        .await
+        .expect("base append task must not hang")
+        .expect("base append task must not panic")
+        .expect("base append must succeed once the gate releases");
 
     let flush_result = timeout(Duration::from_secs(2), flush_rx)
         .await
@@ -989,12 +991,10 @@ async fn test_new_buffered_raft_log_starts_unpoisoned() {
     let (raft_log, _receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             // Safety-net disabled: only write_notify triggers fsync.
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
@@ -1021,12 +1021,10 @@ async fn test_poisoned_survives_reset() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             // Safety-net disabled: only write_notify triggers fsync.
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
@@ -1045,8 +1043,12 @@ async fn test_poisoned_survives_reset() {
 
 /// A `persist_entries()` (page-cache write) failure poisons the log, exactly
 /// like an fsync failure does — these are two independent failure surfaces
-/// (see `persist_pending_range` vs `FsyncCoordinator::run_until_caught_up`)
-/// and both must reach the same fatal outcome.
+/// (`persist_pending_range` vs `FsyncCoordinator::run_until_caught_up`) and
+/// both must reach the same fatal outcome.
+///
+/// The persist runs on the IO thread off `append_entries`'s task, so the
+/// poison lands asynchronously — the black-box guarantee is that the *next*
+/// write is rejected, not that this one fails.
 ///
 /// Without this test, a bug that only wires up ONE of the two poisoning
 /// paths (e.g. fsync failures poison correctly, but persist_entries
@@ -1061,11 +1063,9 @@ async fn test_persist_entries_failure_poisons() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
@@ -1073,9 +1073,9 @@ async fn test_persist_entries_failure_poisons() {
     let raft_log = raft_log.start(receiver, None);
     std::thread::sleep(Duration::from_millis(10)); // ensure IO thread is ready
 
-    // Triggers the IO thread's persist_pending_range call, which hits the
-    // mock's first (failing) persist_entries() — this is the
-    // persist_pending_range poisoning path, NOT FsyncCoordinator's.
+    // Notifies the IO thread, which runs persist_pending_range and hits the
+    // mock's first (failing) persist_entries() — the persist_pending_range
+    // poisoning path, not FsyncCoordinator's.
     raft_log
         .append_entries(vec![Entry {
             index: 1,
@@ -1129,11 +1129,9 @@ async fn test_notify_fatal_channel_closed_still_poisons_and_logs() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
@@ -1166,5 +1164,291 @@ async fn test_notify_fatal_channel_closed_still_poisons_and_logs() {
         crate::test_utils::logs_contain_globally(&logs, "FatalError delivery failed"),
         "a channel-closed failure to notify must still be observable via logs, \
          not a silent no-op — see notify_fatal()'s error! call"
+    );
+}
+
+/// Efficiency: the IO thread's persist scan must start from its own page-cache
+/// frontier, not from `durable_index`. Since #446 `durable_index` only advances
+/// after an `FsyncCompleted` round-trips through raft.rs's event loop; under
+/// load it lags far behind what the IO thread has already written. If the scan
+/// restarted from `durable_index + 1` on every wakeup, each of N appends would
+/// re-scan and re-`persist_entries` the whole not-yet-durable window — O(N^2)
+/// total work.
+///
+/// This test pins `durable_index` at 0 (no `log_flush_tx`, so no
+/// `FsyncCompleted` is ever consumed) and appends N entries one at a time. The
+/// total number of entries handed to `persist_entries` across all calls must
+/// stay ~N, not ~N^2/2.
+#[tokio::test]
+async fn test_persist_scan_tracks_frontier_not_stuck_durable_index() {
+    let persisted_total = Arc::new(AtomicU64::new(0));
+    let persisted_total_c = persisted_total.clone();
+
+    let mut log_store = MockLogStore::new();
+    log_store.expect_last_index().returning(|| 0);
+    log_store.expect_persist_entries().returning(move |entries| {
+        persisted_total_c.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        Ok(())
+    });
+    log_store.expect_entry().returning(|_| Ok(None));
+    log_store.expect_get_entries().returning(|_| Ok(vec![]));
+    log_store.expect_purge().returning(|_| Ok(()));
+    log_store.expect_load_purge_boundary().returning(|| Ok(None));
+    log_store.expect_reset().returning(|| Ok(()));
+    log_store.expect_truncate().returning(|_| Ok(()));
+    log_store.expect_replace_range().returning(|from, new_entries| {
+        Ok(new_entries.last().map(|e| e.index).unwrap_or(from.saturating_sub(1)))
+    });
+    log_store.expect_is_write_durable().returning(|| false);
+    log_store.expect_flush().returning(|| Ok(()));
+    log_store.expect_flush_async().returning(|| Ok(()));
+
+    let mut meta_store = MockMetaStore::new();
+    meta_store.expect_save_hard_state().returning(|_| Ok(()));
+    meta_store.expect_load_hard_state().returning(|| Ok(None));
+    meta_store.expect_flush().returning(|| Ok(()));
+    meta_store.expect_flush_async().returning(|| Ok(()));
+
+    let storage = Arc::new(MockStorageEngine::from(log_store, meta_store));
+    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        storage,
+    );
+    // No log_flush_tx: FsyncCompleted is never consumed, so durable_index
+    // stays pinned at 0 for the whole test.
+    let raft_log = raft_log.start(receiver, None);
+    std::thread::sleep(Duration::from_millis(10));
+
+    const N: u64 = 100;
+    for i in 1..=N {
+        raft_log
+            .append_entries(vec![Entry {
+                index: i,
+                term: 1,
+                payload: None,
+            }])
+            .await
+            .unwrap();
+        // flush() forces the IO thread to persist up to memory_max_index right
+        // now, so the scan boundary is exercised once per append — deterministic,
+        // no sleeps.
+        raft_log.flush().await.unwrap();
+    }
+
+    assert_eq!(
+        raft_log.durable_index(),
+        0,
+        "durable_index must stay stuck for this test to be meaningful"
+    );
+    let total = persisted_total.load(Ordering::Relaxed);
+    assert!(
+        total < 3 * N,
+        "persist_entries received {total} entries for {N} appends; a frontier-tracking \
+         scan is ~{N}, a durable_index-relative scan would be ~{} (O(N^2))",
+        N * (N + 1) / 2
+    );
+}
+
+/// Cold start: after a restart, `durable_index` starts at the disk length and
+/// the IO thread's persist frontier must start *past* it. The first write's
+/// persist scan begins at `durable_index + 1` — an already-durable entry on
+/// disk must never be handed back to `persist_entries`.
+///
+/// Guards the frontier initialization (`= durable_index`, scans use `+ 1`).
+#[tokio::test]
+async fn test_cold_start_persist_frontier_starts_past_durable_index() {
+    let persist_calls: Arc<Mutex<Vec<Vec<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let mut log_store = MockLogStore::new();
+    log_store.expect_last_index().returning(|| 5); // disk already holds 1..=5
+    log_store.expect_get_entries().returning(|range| {
+        Ok(range
+            .map(|i| Entry {
+                index: i,
+                term: 1,
+                payload: None,
+            })
+            .collect())
+    });
+    {
+        let calls = persist_calls.clone();
+        log_store.expect_persist_entries().returning(move |entries| {
+            calls.lock().unwrap().push(entries.iter().map(|e| e.index).collect());
+            Ok(())
+        });
+    }
+    log_store.expect_entry().returning(|_| Ok(None));
+    log_store.expect_purge().returning(|_| Ok(()));
+    log_store.expect_load_purge_boundary().returning(|| Ok(None));
+    log_store.expect_reset().returning(|| Ok(()));
+    log_store.expect_truncate().returning(|_| Ok(()));
+    log_store
+        .expect_replace_range()
+        .returning(|from, e| Ok(e.last().map(|x| x.index).unwrap_or(from.saturating_sub(1))));
+    log_store.expect_is_write_durable().returning(|| false);
+    log_store.expect_flush().returning(|| Ok(()));
+    log_store.expect_flush_async().returning(|| Ok(()));
+
+    let mut meta_store = MockMetaStore::new();
+    meta_store.expect_save_hard_state().returning(|_| Ok(()));
+    meta_store.expect_load_hard_state().returning(|| Ok(None));
+    meta_store.expect_flush().returning(|| Ok(()));
+    meta_store.expect_flush_async().returning(|| Ok(()));
+
+    let storage = Arc::new(MockStorageEngine::from(log_store, meta_store));
+    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        storage,
+    );
+    let raft_log = raft_log.start(receiver, None);
+    std::thread::sleep(Duration::from_millis(10));
+
+    assert_eq!(
+        raft_log.durable_index(),
+        5,
+        "restart: disk length 5 is treated as durable"
+    );
+
+    // First write after restart. Its persist scan must start at 6.
+    raft_log
+        .append_entries(vec![Entry {
+            index: 6,
+            term: 1,
+            payload: None,
+        }])
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let calls = persist_calls.lock().unwrap().clone();
+    assert!(!calls.is_empty(), "entry 6 must have been persisted");
+    assert!(
+        calls.iter().flatten().all(|&idx| idx >= 6),
+        "cold start: the first persist must scan from durable_index+1 (6), never \
+         re-scan already-durable entry 5. Got: {calls:?}"
+    );
+}
+
+/// The flush turn's unconditional tail re-scan must persist writes that were
+/// coalesced into the turn — a write whose `IOTask::Persist` is dropped in the
+/// drain loop still becomes durable, because the catch-up re-reads
+/// `memory_max_index` and persists everything past the frontier.
+///
+/// Deterministic via a per-call persist gate: every `persist_entries` announces
+/// its indices and blocks until released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn test_flush_turn_catch_up_persists_writes_coalesced_during_the_turn() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<Vec<u64>>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+
+    let mut log_store = MockLogStore::new();
+    log_store.expect_last_index().returning(|| 0);
+    log_store.expect_persist_entries().returning(move |entries| {
+        entered_tx.send(entries.iter().map(|e| e.index).collect()).ok();
+        release_rx.lock().unwrap().recv().ok();
+        Ok(())
+    });
+    log_store.expect_entry().returning(|_| Ok(None));
+    log_store.expect_get_entries().returning(|_| Ok(vec![]));
+    log_store.expect_purge().returning(|_| Ok(()));
+    log_store.expect_load_purge_boundary().returning(|| Ok(None));
+    log_store.expect_reset().returning(|| Ok(()));
+    log_store.expect_truncate().returning(|_| Ok(()));
+    log_store
+        .expect_replace_range()
+        .returning(|from, e| Ok(e.last().map(|x| x.index).unwrap_or(from.saturating_sub(1))));
+    log_store.expect_is_write_durable().returning(|| false);
+    log_store.expect_flush().returning(|| Ok(()));
+    log_store.expect_flush_async().returning(|| Ok(()));
+
+    let mut meta_store = MockMetaStore::new();
+    meta_store.expect_save_hard_state().returning(|_| Ok(()));
+    meta_store.expect_load_hard_state().returning(|| Ok(None));
+    meta_store.expect_flush().returning(|| Ok(()));
+    meta_store.expect_flush_async().returning(|| Ok(()));
+
+    let storage = Arc::new(MockStorageEngine::from(log_store, meta_store));
+    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        storage,
+    );
+    let (log_flush_tx, mut log_flush_rx) = mpsc::unbounded_channel();
+    let raft_log = raft_log.start(receiver, Some(log_flush_tx));
+    std::thread::sleep(Duration::from_millis(10));
+
+    let e = |i: u64| Entry {
+        index: i,
+        term: 1,
+        payload: None,
+    };
+
+    // 1..=2 persisted (frontier → 2).
+    raft_log.append_entries(vec![e(1), e(2)]).await.unwrap();
+    assert_eq!(entered_rx.recv().unwrap(), vec![1, 2]);
+    release_tx.send(()).unwrap();
+
+    // 3..=4: their Persist is in progress (blocked in persist_entries).
+    raft_log.append_entries(vec![e(3), e(4)]).await.unwrap();
+    assert_eq!(entered_rx.recv().unwrap(), vec![3, 4]);
+
+    // flush() enqueues IOTask::Flush behind the in-progress Persist(3,4).
+    let flush_task = {
+        let rl = raft_log.clone();
+        tokio::spawn(async move { rl.flush().await })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // 5..=6 land while Persist(3,4) is still blocked → their Persist queues
+    // behind Flush.
+    raft_log.append_entries(vec![e(5), e(6)]).await.unwrap();
+    release_tx.send(()).unwrap(); // release Persist(3,4) → frontier → 4
+
+    // IO thread moves to Flush → run_flush_turn. Leading persist covers 5,6.
+    assert_eq!(entered_rx.recv().unwrap(), vec![5, 6]);
+
+    // 7..=8 land now — after run_flush_turn read memory_max for its leading
+    // persist, before its drain loop. Their Persist queues behind Flush and
+    // will be dropped in the drain loop.
+    raft_log.append_entries(vec![e(7), e(8)]).await.unwrap();
+    release_tx.send(()).unwrap(); // release leading persist(5,6) → frontier → 6
+
+    // The drain loop drops Persist(5,6) and Persist(7,8); the unconditional
+    // tail re-scan then persists 7,8.
+    assert_eq!(
+        entered_rx.recv().unwrap(),
+        vec![7, 8],
+        "flush turn's tail re-scan must persist 7,8 whose Persist was dropped"
+    );
+    release_tx.send(()).unwrap();
+
+    flush_task.await.unwrap().unwrap();
+    while let Ok(ev) = log_flush_rx.try_recv() {
+        if let crate::InternalEvent::FsyncCompleted(mark) = ev {
+            raft_log.try_advance_durable_index(mark);
+        }
+    }
+    assert_eq!(
+        raft_log.durable_index(),
+        8,
+        "7,8 (coalesced into the flush turn) must be durable via the catch-up"
     );
 }

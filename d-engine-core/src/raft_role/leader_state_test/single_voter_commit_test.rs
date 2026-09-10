@@ -1,17 +1,16 @@
 //! Single-Voter Commit Path Tests
 //!
-//! Regression tests for the MemFirst single-voter commit path in `handle_log_flushed`.
+//! RPO=0 (#446): `handle_log_flushed` single-voter branch must commit to `durable`, not
+//! `last_entry_id()` — a single-voter cluster has no majority to fall back on, so if the
+//! leader itself hasn't fsynced an entry, there is no copy anywhere safe from power loss.
 //!
-//! ## Bug History
-//! `fix #329` changed `handle_log_flushed` single-voter branch to commit to `durable`
-//! instead of `last_entry_id()`. This placed IO thread latency on the commit critical
-//! path, causing a ~3x latency regression in 3-node embedded bench (1731µs vs ~566µs).
-//!
-//! ## MemFirst Single-Voter Invariant
-//! `LogFlushed(durable)` is an IO checkpoint. Commit must advance to `last_entry_id()`
-//! — not just `durable` — to allow pipelining across IO batch boundaries.
-//! This matches the multi-voter path where the leader contributes `last_entry_id()` to
-//! quorum (not `durable_index`).
+//! ## Superseded design (kept as history, do not resurrect)
+//! `fix #329` changed this branch to commit to `durable` instead of `last_entry_id()`,
+//! then reverted it after measuring a ~3x latency regression in 3-node embedded bench
+//! (1731µs vs ~566µs) — IO thread latency landed on the commit critical path. That
+//! regression is real and will resurface here. RPO=0 makes paying it mandatory for
+//! single-voter clusters — there is no majority to absorb the risk the old design
+//! accepted.
 
 use crate::MockMembership;
 use crate::MockRaftLog;
@@ -61,16 +60,16 @@ async fn setup_single_voter(
     (state, ctx, last_entry_id)
 }
 
-/// MemFirst single-voter: `handle_log_flushed` must commit to `last_entry_id`, not `durable`.
+/// RPO=0: `handle_log_flushed` must commit to `durable`, not `last_entry_id`.
 ///
-/// Simulates: IO batch flushed entries 1-3 (`durable=3`), but entries 4-5 arrived
-/// in memory during the flush (`last_entry_id=5`). MemFirst: commit must advance
-/// to 5 (all in-memory entries), not stall at 3 (only persisted entries).
+/// Simulates: entries 4-5 arrived in memory (`last_entry_id=5`) but the IO batch has
+/// only flushed entries 1-3 so far (`durable=3`). Commit must stay at 3 — entries 4-5
+/// aren't crash-safe yet, and a single-voter cluster has no other copy to fall back on.
 ///
-/// This test FAILS if `handle_log_flushed` uses `durable` for commit
-/// (the `fix #329` regression that caused +617µs avg latency in 3-node embedded bench).
+/// This test FAILS if `handle_log_flushed` still uses `last_entry_id` for commit (the
+/// old MemFirst behavior, since revoked — RPO=0 makes single-voter durability mandatory).
 #[tokio::test]
-async fn test_single_voter_commit_uses_last_entry_id_not_durable() {
+async fn test_single_voter_commit_uses_durable_not_last_entry_id() {
     // last_entry_id=5: entries 4-5 arrived in memory during the IO flush of 1-3
     let (mut state, ctx, _last_entry_id) = setup_single_voter(5).await;
     let (internal_event_tx, _internal_event_rx) = mpsc::unbounded_channel();
@@ -80,13 +79,13 @@ async fn test_single_voter_commit_uses_last_entry_id_not_durable() {
 
     assert_eq!(
         state.commit_index(),
-        5,
-        "MemFirst single-voter: commit must use last_entry_id=5, not durable=3. \
-         Using durable puts IO latency on the commit critical path."
+        3,
+        "RPO=0: commit must use durable=3, not last_entry_id=5 — entries 4-5 aren't \
+         fsynced yet, and single-voter has no majority to fall back on"
     );
 }
 
-/// After IO catches up (durable == last_entry_id), commit equals last_entry_id.
+/// After IO catches up (durable == last_entry_id), commit equals durable.
 #[tokio::test]
 async fn test_single_voter_commit_when_durable_equals_last_entry_id() {
     let (mut state, ctx, _last_entry_id) = setup_single_voter(5).await;
@@ -94,20 +93,16 @@ async fn test_single_voter_commit_when_durable_equals_last_entry_id() {
 
     state.handle_log_flushed(5, &ctx, &internal_event_tx).await;
 
-    assert_eq!(
-        state.commit_index(),
-        5,
-        "commit must advance to last_entry_id=5 when durable=5"
-    );
+    assert_eq!(state.commit_index(), 5, "commit must advance to durable=5");
 }
 
-/// Pipelining across multiple IO batches: each flush triggers commit to current last_entry_id.
+/// Commit tracks `durable` across IO batches, not the in-memory tail.
 ///
-/// Simulates rapid writes where IO batches lag behind in-memory log:
-/// - Flush 1: IO flushed 1-3, log has 1-7 in memory → commit=7
-/// - Flush 2: IO flushed 4-7, log has 1-10 in memory → commit=10
+/// Simulates rapid writes where the in-memory log runs ahead of what's fsynced:
+/// - Flush 1: IO flushed 1-3 (durable=3), memory has 1-7 → commit=3, not 7
+/// - Flush 2: IO flushed 4-7 (durable=7), memory now has 1-10 → commit=7, not 10
 #[tokio::test]
-async fn test_single_voter_pipelining_across_io_batches() {
+async fn test_single_voter_commit_tracks_durable_not_memory_tail() {
     let (mut state, ctx, last_entry_id) = setup_single_voter(7).await;
     let (internal_event_tx, _internal_event_rx) = mpsc::unbounded_channel();
 
@@ -115,8 +110,8 @@ async fn test_single_voter_pipelining_across_io_batches() {
     state.handle_log_flushed(3, &ctx, &internal_event_tx).await;
     assert_eq!(
         state.commit_index(),
-        7,
-        "commit must advance to last_entry_id=7"
+        3,
+        "commit must stay at durable=3 — entries 4-7 aren't fsynced yet"
     );
 
     // IO batch 2: flushed 4-7, memory now has 1-10
@@ -124,14 +119,14 @@ async fn test_single_voter_pipelining_across_io_batches() {
     state.handle_log_flushed(7, &ctx, &internal_event_tx).await;
     assert_eq!(
         state.commit_index(),
-        10,
-        "commit must advance to last_entry_id=10"
+        7,
+        "commit must advance to durable=7, not the in-memory tail (10)"
     );
 }
 
-/// No-op flush: last_entry_id == commit_index means nothing new to commit.
+/// No-op flush: durable == commit_index means nothing new is safe to commit yet.
 #[tokio::test]
-async fn test_single_voter_no_commit_when_nothing_new() {
+async fn test_single_voter_no_commit_when_nothing_new_durable() {
     let (mut state, ctx, _last_entry_id) = setup_single_voter(3).await;
     let (internal_event_tx, _internal_event_rx) = mpsc::unbounded_channel();
 
@@ -139,11 +134,11 @@ async fn test_single_voter_no_commit_when_nothing_new() {
     state.handle_log_flushed(3, &ctx, &internal_event_tx).await;
     assert_eq!(state.commit_index(), 3);
 
-    // Second flush with same last_entry_id=3: no new entries → no commit advance
+    // Second flush with same durable=3: nothing new is fsynced → no commit advance
     state.handle_log_flushed(3, &ctx, &internal_event_tx).await;
     assert_eq!(
         state.commit_index(),
         3,
-        "commit must not advance when last_entry_id == commit_index"
+        "commit must not advance when durable == commit_index"
     );
 }

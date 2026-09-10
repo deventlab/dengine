@@ -994,6 +994,16 @@ async fn test_handle_append_entries_success_from_new_leader() {
         "Should update commit_index"
     );
 
+    // RPO=0 (#446): the success ACK is withheld until durable_index reaches the claimed index.
+    assert!(
+        resp_rx.try_recv().is_err(),
+        "ACK must be withheld until durable_index catches up"
+    );
+
+    // Simulate LogFlushed: durable_index advances to 1, releasing the withheld ACK.
+    let (flush_tx, _flush_rx) = mpsc::unbounded_channel();
+    state.handle_log_flushed(1, &context, &flush_tx).await;
+
     // Verify: Response with success=true
     let response = resp_rx.recv().await.expect("should receive response").unwrap();
     assert!(response.is_success(), "Response should indicate success");
@@ -2882,15 +2892,17 @@ async fn test_follower_rejects_strong_consistency_reads() {
 }
 
 // ============================================================================
-// MemFirst ACK Tests
+// Withheld-ACK tests (RPO=0, #446)
+//
+// End-to-end coverage of the AppendEntries workflow deciding to withhold or send.
+// The queue mechanics (release / reject / carry across a role transition) are
+// unit-tested in `pending_ack_test.rs`.
 // ============================================================================
 
-/// Follower ACKs leader immediately after memory write (MemFirst).
-///
-/// The IO thread continues to fsync asynchronously. Safety: before commit,
-/// the leader's durable_index >= N (quorum uses durable_index).
+/// The workflow withholds a success ACK while durable_index is behind the claimed
+/// index, and releases it once `handle_log_flushed` reports that index durable.
 #[tokio::test]
-async fn test_follower_acks_immediately_after_memory_write() {
+async fn test_follower_withholds_ack_until_durable() {
     let (_graceful_tx, graceful_rx) = watch::channel(());
     let (mut context, _temp_dir) = mock_raft_context_with_temp(graceful_rx, None);
 
@@ -2937,9 +2949,109 @@ async fn test_follower_acks_immediately_after_memory_write() {
             .is_ok()
     );
 
-    // MemFirst: ACK sent immediately, no waiting for fsync
-    let response = resp_rx.try_recv().expect("ACK must be sent immediately after memory write");
-    assert!(response.unwrap().is_success());
+    // RPO=0: the ACK is withheld while durable_index < claimed index (5).
+    assert!(
+        resp_rx.try_recv().is_err(),
+        "ACK must be withheld until durable_index catches up"
+    );
+
+    // Simulate LogFlushed: durable_index advances to 5, releasing the withheld ACK.
+    let (flush_tx, _flush_rx) = mpsc::unbounded_channel();
+    state.handle_log_flushed(appended_index, &context, &flush_tx).await;
+
+    let response = resp_rx.try_recv().expect("ACK must be released once durable").unwrap();
+    assert!(response.is_success());
+}
+
+/// #446: two independent AppendEntries requests (e.g. a leader retry) that both claim
+/// the same threshold index must both eventually receive a response — the second one
+/// landing on `pending_append_acks` must not silently overwrite the first.
+#[tokio::test]
+async fn test_multiple_requests_at_same_threshold_all_receive_response() {
+    let (_graceful_tx, graceful_rx) = watch::channel(());
+    let (mut context, _temp_dir) = mock_raft_context_with_temp(graceful_rx, None);
+
+    let leader_term = 2u64;
+    let claimed_index = 5u64;
+
+    let mut replication_handler = MockReplicationCore::new();
+    replication_handler
+        .expect_handle_append_entries()
+        .times(2)
+        .returning(move |_, _, _| {
+            Ok(AppendResponseWithUpdates {
+                response: AppendEntriesResponse::success(
+                    1,
+                    leader_term,
+                    Some(LogId {
+                        term: leader_term,
+                        index: claimed_index,
+                    }),
+                ),
+                commit_index_update: None,
+            })
+        });
+    context.handlers.replication_handler = replication_handler;
+    context.membership = Arc::new(MockMembership::new());
+
+    let mut state =
+        FollowerState::<MockTypeConfig>::new(1, context.node_config.clone(), None, None);
+    state.shared_state_mut().update_current_term(leader_term);
+
+    let append_request = AppendEntriesRequest {
+        term: leader_term,
+        leader_id: 2,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: vec![],
+        leader_commit_index: 0,
+    };
+    let (internal_event_tx, _internal_event_rx) = mpsc::unbounded_channel();
+
+    // First request lands on threshold=5 and gets withheld.
+    let (resp_tx1, mut resp_rx1) = MaybeCloneOneshot::new();
+    state
+        .handle_inbound_event(
+            InboundEvent::AppendEntries(append_request.clone(), vec![resp_tx1]),
+            &context,
+            internal_event_tx.clone(),
+        )
+        .await
+        .unwrap();
+
+    // A second, independent request (e.g. leader retry) also claims index 5.
+    let (resp_tx2, mut resp_rx2) = MaybeCloneOneshot::new();
+    state
+        .handle_inbound_event(
+            InboundEvent::AppendEntries(append_request, vec![resp_tx2]),
+            &context,
+            internal_event_tx,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        resp_rx1.try_recv().is_err(),
+        "first request must still be withheld"
+    );
+    assert!(
+        resp_rx2.try_recv().is_err(),
+        "second request must still be withheld"
+    );
+
+    let (flush_tx, _flush_rx) = mpsc::unbounded_channel();
+    state.handle_log_flushed(claimed_index, &context, &flush_tx).await;
+
+    // Both senders — not just one — must receive a response. A single-value
+    // `BTreeMap<u64, PendingAck>` without `.entry().or_insert_with(...)` merging would
+    // let the second insert silently overwrite the first, dropping this ACK forever.
+    let response1 = resp_rx1.try_recv().expect("first sender must receive a response").unwrap();
+    let response2 = resp_rx2
+        .try_recv()
+        .expect("second sender must also receive a response, not be silently overwritten")
+        .unwrap();
+    assert!(response1.is_success());
+    assert!(response2.is_success());
 }
 
 /// Follower sends ACK immediately for heartbeat (no entries).
@@ -3042,8 +3154,18 @@ async fn test_follower_commit_index_and_ack_both_sent_immediately() {
         new_commit,
         "commit_index must advance immediately"
     );
-    let response = resp_rx.try_recv().expect("ACK must be sent immediately");
-    assert!(response.unwrap().is_success());
+    // RPO=0: commit_index advances immediately, but the ACK is withheld until durable.
+    assert!(
+        resp_rx.try_recv().is_err(),
+        "ACK must be withheld until durable_index catches up"
+    );
+
+    // Simulate LogFlushed: durable_index advances to 5, releasing the withheld ACK.
+    let (flush_tx, _flush_rx) = mpsc::unbounded_channel();
+    state.handle_log_flushed(appended_index, &context, &flush_tx).await;
+
+    let response = resp_rx.try_recv().expect("ACK must be released once durable").unwrap();
+    assert!(response.is_success());
 }
 
 /// Spawns a fake Worker that answers exactly one `InstallSnapshot` command with `result`,

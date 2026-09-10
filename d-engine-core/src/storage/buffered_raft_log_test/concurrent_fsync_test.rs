@@ -6,11 +6,12 @@
 //!   advance_durable_and_notify contract
 //! - **Concurrency**: Reset races, out-of-order completion, crash recovery
 
+use crate::test_utils::drain_and_apply_fsync_completions;
 use crate::{
-    BufferedRaftLog, FlushPolicy, InternalEvent, MockStorageEngine, MockTypeConfig,
-    PersistenceConfig, PersistenceStrategy, RaftLog,
+    BufferedRaftLog, FlushPolicy, MockStorageEngine, MockTypeConfig, PersistenceConfig, RaftLog,
 };
 use d_engine_proto::common::Entry;
+use d_engine_proto::common::LogId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -34,16 +35,18 @@ async fn test_durable_index_not_advanced_before_fsync_completes() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
     );
-    let raft_log = raft_log.start(receiver, None);
+    // A real log_flush_tx is required now: durable_index only advances when
+    // something drains InternalEvent::FsyncCompleted and calls
+    // try_advance_durable_index — see drain_and_apply_fsync_completions.
+    let (log_flush_tx, mut log_flush_rx) = mpsc::unbounded_channel();
+    let raft_log = raft_log.start(receiver, Some(log_flush_tx));
     std::thread::sleep(Duration::from_millis(10)); // ensure IO thread is ready
 
     let pre_write_durable_index = raft_log.durable_index();
@@ -71,12 +74,13 @@ async fn test_durable_index_not_advanced_before_fsync_completes() {
         "durable_index must not advance before fsync completes"
     );
 
-    // Release the gate — flush() returns, advance_durable_and_notify(1) fires.
+    // Release the gate — flush() returns, notify_fsync_completed(1, 1) fires.
     flush_gate.send(()).unwrap();
 
     // Pick a polling/backoff strategy instead of a fixed sleep,
     // to avoid flakiness under CI load.
     tokio::time::sleep(Duration::from_millis(50)).await;
+    drain_and_apply_fsync_completions(&raft_log, &mut log_flush_rx);
 
     assert_eq!(
         raft_log.durable_index(),
@@ -85,44 +89,48 @@ async fn test_durable_index_not_advanced_before_fsync_completes() {
     );
 }
 
-/// `calculate_majority_matched_index` uses the in-memory SkipMap (`last_entry_id`),
-/// not `durable_index` — even when all fsyncs are stalled indefinitely.
+/// `calculate_majority_matched_index` uses `durable_index` (fsync-confirmed), not the
+/// in-memory `last_entry_id` — even when a follower already reports the index, the
+/// leader's own contribution must not count toward quorum until it has itself fsynced.
 ///
-/// Stall every flush() call via a MockLogStore barrier, append entries, then verify
-/// that majority-matched calculation returns the correct in-memory index.
+/// Stall every flush() call via a MockLogStore barrier, append entries, then verify that
+/// majority-matched calculation does NOT advance while fsync is stalled, and does advance
+/// once fsync completes.
 ///
-/// Regression guard: if majority calculation ever changes to depend on `durable_index`,
-/// this test will catch it before it reaches production.
+/// Regression guard: RPO=0 (#446) requires the leader's own copy to be durable before it
+/// counts toward commit — if this ever reverts to using `last_entry_id`, this test will
+/// catch it before it reaches production.
 ///
 /// Expected:
-///   - Append entries so `last_entry_id()` reaches N (e.g. 5) while fsync is
-///     permanently stalled — `durable_index()` stays at its pre-write value
-///     (0) throughout.
-///   - Feed `calculate_majority_matched_index` a `match_index` map where enough
-///     followers already report N to form a majority.
-///   - Assert the returned majority-matched index equals N (matching
-///     `last_entry_id()`) — NOT 0 (what it would return if it mistakenly used
-///     `durable_index()` instead).
+///   - Append entries so `last_entry_id()` reaches N (e.g. 2) while fsync is permanently
+///     stalled — `durable_index()` stays at its pre-write value (0) throughout.
+///   - Feed `calculate_majority_matched_index` a `match_index` map where one follower
+///     already reports N=2 (majority IF the leader's own un-fsynced entry counted) —
+///     assert the result is `None` while durable_index is still 0.
+///   - Release the gate. Once `durable_index` reaches 2, the same call must return
+///     `Some(2)`.
 #[tokio::test]
-async fn test_majority_matched_index_uses_memory_not_durable_index() {
+async fn test_majority_matched_index_uses_durable_not_memory() {
     // Gate closed: the first flush() call will block until we send () on `flush_gate`.
     let (storage, flush_gate) = MockStorageEngine::not_durable_gated_flush(
-        "majority_matched_index_uses_memory_not_durable_index".into(),
+        "majority_matched_index_uses_durable_not_memory".into(),
     );
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             // Safety-net disabled: only write_notify should trigger fsync here.
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
     );
-    let raft_log = raft_log.start(receiver, None);
+    // A real log_flush_tx is required now: durable_index only advances when
+    // something drains InternalEvent::FsyncCompleted and calls
+    // try_advance_durable_index — see drain_and_apply_fsync_completions.
+    let (log_flush_tx, mut log_flush_rx) = mpsc::unbounded_channel();
+    let raft_log = raft_log.start(receiver, Some(log_flush_tx));
     std::thread::sleep(Duration::from_millis(10)); // ensure IO thread is ready
 
     let pre_write_durable_index = raft_log.durable_index();
@@ -160,32 +168,41 @@ async fn test_majority_matched_index_uses_memory_not_durable_index() {
     assert_eq!(
         raft_log.last_entry_id(),
         pre_last_entry_id + size,
-        "durable_index must not advance before fsync completes"
+        "in-memory tail should still advance even while fsync is stalled"
     );
 
     // One follower already matched index 2; the other is still behind at 0 — asymmetric
-    // on purpose. With only ONE follower at 2, the leader's own contribution decides
-    // whether the majority (2 out of 3 voters) reaches 2. If this ever regresses to use
-    // `durable_index()` (0, since fsync is still gated) instead of `last_entry_id()` (2),
-    // the median drops to 0 and the call returns `None` instead of `Some(2)`.
+    // on purpose. If the leader's own un-fsynced entry counted (the old MemFirst
+    // behavior), 2 out of 3 voters would reach index 2 — but RPO=0 requires the
+    // leader's own copy to be durable first, so this must return None while fsync
+    // is still gated.
     let result = raft_log.calculate_majority_matched_index(1, 1, vec![2, 0]);
     assert_eq!(
-        result,
-        Some(2),
-        "majority index must use last_entry_id (2), not durable_index (0)"
+        result, None,
+        "RPO=0: the leader's own un-fsynced entry must not count toward quorum, even \
+         when a follower already reports it"
     );
 
-    // Release the gate — flush() returns, advance_durable_and_notify(1) fires.
+    // Release the gate — flush() returns, notify_fsync_completed(2, 1) fires.
     flush_gate.send(()).unwrap();
 
     // Pick a polling/backoff strategy instead of a fixed sleep,
     // to avoid flakiness under CI load.
     tokio::time::sleep(Duration::from_millis(50)).await;
+    drain_and_apply_fsync_completions(&raft_log, &mut log_flush_rx);
 
     assert_eq!(
         raft_log.durable_index(),
         pre_write_durable_index + size,
         "durable_index must reach the expected index after fsync completes"
+    );
+
+    // Now the leader's own contribution is durable (2), so the same call must succeed.
+    let result_after_fsync = raft_log.calculate_majority_matched_index(1, 1, vec![2, 0]);
+    assert_eq!(
+        result_after_fsync,
+        Some(2),
+        "once the leader's own entry is durable, majority index must advance to 2"
     );
 }
 
@@ -212,11 +229,9 @@ async fn test_entry_term_correct_during_concurrent_fsync_delay() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
@@ -275,24 +290,24 @@ async fn test_entry_term_correct_during_concurrent_fsync_delay() {
 
 // ── Logic correctness ─────────────────────────────────────────────────────────
 
-/// `advance_durable_and_notify` is monotonic: a late-arriving lower index is a no-op.
+/// `try_advance_durable_index` is monotonic: a late-arriving lower index is a no-op.
 ///
-/// Directly call `advance_durable_and_notify(150)`, then `advance_durable_and_notify(100)`.
+/// Directly call `try_advance_durable_index(150, 1)`, then `try_advance_durable_index(100, 1)`.
 /// Assert:
 ///   - final `durable_index() == 150` (not 100)
-///   - `LogFlushed` event fired exactly once (for 150), not twice
+///   - the 150 call returns `Some(150)` (it fired), the 100 call returns `None` (no-op)
 ///
 /// Verifies the `fetch_max` invariant that makes out-of-order concurrent fsyncs safe.
 ///
-/// Expected:
-///   - After `advance_durable_and_notify(150)`: `durable_index() == 150`.
-///   - After the subsequent `advance_durable_and_notify(100)`: `durable_index()`
-///     is STILL `150` (unchanged — 100 < 150 must be a no-op, not a regression).
-///   - The flush-completion notification fires exactly once, carrying 150 — the
-///     discarded 100 call must not fire a second notification.
+/// Test changed from #446/#447's original (which checked an `InternalEvent::LogFlushed`
+/// on a channel): `try_advance_durable_index` no longer sends that notification itself —
+/// the caller (raft.rs's `FsyncCompleted` handler) decides whether to fire
+/// `handle_log_flushed`, based on this method's `Option<u64>` return value. So "fired
+/// exactly once, only for 150" is now asserted directly on the return values instead of
+/// on a channel — same intent, moved to match where the behavior actually lives now.
 #[tokio::test]
 async fn test_durable_index_monotonic_when_fsyncs_complete_out_of_order() {
-    // Storage engine choice doesn't matter here — advance_durable_and_notify is
+    // Storage engine choice doesn't matter here — try_advance_durable_index is
     // called directly, bypassing the real fsync pipeline entirely.
     let storage = Arc::new(MockStorageEngine::with_id(
         "durable_index_monotonic_when_fsyncs_complete_out_of_order".into(),
@@ -300,43 +315,52 @@ async fn test_durable_index_monotonic_when_fsyncs_complete_out_of_order() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         storage,
     );
-    let (log_flush_tx, mut log_flush_rx) = mpsc::unbounded_channel::<InternalEvent>();
-    let raft_log = raft_log.start(receiver, Some(log_flush_tx));
+    let raft_log = raft_log.start(receiver, None);
     std::thread::sleep(Duration::from_millis(10)); // ensure IO thread is ready
+
+    // try_advance_durable_index() content-validates against entry_term(index) —
+    // needs real entries in memory, not just a raw max_index poke.
+    let entries: Vec<Entry> = (1..=150)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            payload: None,
+        })
+        .collect();
+    raft_log.append_entries(entries).await.unwrap();
 
     // Simulates a fsync task completing with index 150, then a second, older
     // fsync task (dispatched earlier, finishing later) completing with 100.
-    raft_log.advance_durable_and_notify(150);
-    raft_log.advance_durable_and_notify(100);
+    let result_150 = raft_log.try_advance_durable_index(LogId {
+        term: 1,
+        index: 150,
+    });
+    let result_100 = raft_log.try_advance_durable_index(LogId {
+        term: 1,
+        index: 100,
+    });
 
+    assert_eq!(
+        result_150,
+        Some(150),
+        "the 150 call must fire — it's the first advance"
+    );
+    assert_eq!(
+        result_100, None,
+        "the later, lower 100 call must be a no-op (None), not a regression"
+    );
     assert_eq!(
         raft_log.durable_index(),
         150,
         "durable_index must reflect the highest index seen (150), not the \
          later-arriving lower one (100)"
-    );
-
-    // Exactly one LogFlushed event must have fired, carrying 150 — the
-    // no-op 100 call must not have sent a second event.
-    let event = log_flush_rx.try_recv().expect("LogFlushed must fire for the 150 call");
-    match event {
-        InternalEvent::LogFlushed { durable_index } => {
-            assert_eq!(durable_index, 150, "LogFlushed must carry 150, not 100");
-        }
-        other => panic!("expected InternalEvent::LogFlushed, got {other:?}"),
-    }
-    assert!(
-        log_flush_rx.try_recv().is_err(),
-        "no second LogFlushed event should have fired for the no-op 100 call"
     );
 }
 
@@ -364,11 +388,9 @@ async fn test_flush_caller_blocked_until_fsync_completes() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
@@ -438,11 +460,9 @@ async fn test_flush_callers_arriving_during_inflight_fsync_are_coalesced() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
@@ -522,11 +542,9 @@ async fn test_shutdown_with_pending_flush_caller_still_receives_ok_reply() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 100,
         },
         Arc::new(storage),
@@ -596,11 +614,9 @@ async fn test_shutdown_with_pending_flush_caller_still_receives_err_reply() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 100,
         },
         Arc::new(storage),
@@ -677,11 +693,9 @@ async fn test_reset_during_inflight_fsync_does_not_resurrect_stale_durable_index
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
@@ -759,16 +773,15 @@ async fn test_post_reset_writes_are_not_discarded_by_stale_fence() {
     let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
         1,
         PersistenceConfig {
-            strategy: PersistenceStrategy::MemFirst,
             flush_policy: FlushPolicy::Batch {
                 idle_flush_interval_ms: 60_000,
             },
-            max_buffered_entries: 1000,
             shutdown_timeout_ms: 5000,
         },
         Arc::new(storage),
     );
-    let raft_log = raft_log.start(receiver, None);
+    let (log_flush_tx, mut log_flush_rx) = mpsc::unbounded_channel();
+    let raft_log = raft_log.start(receiver, Some(log_flush_tx));
     std::thread::sleep(Duration::from_millis(10)); // ensure IO thread is ready
 
     // Append triggers the automatic round (round 1), which wins the CAS and
@@ -819,6 +832,7 @@ async fn test_post_reset_writes_are_not_discarded_by_stale_fence() {
         result.is_ok(),
         "Y's flush() must succeed — its data was written after reset, not stale"
     );
+    drain_and_apply_fsync_completions(&raft_log, &mut log_flush_rx);
     assert_eq!(
         raft_log.durable_index(),
         1,

@@ -59,7 +59,7 @@ _(v0.2.5: 6-round average; v0.2.4: 4-round average; v0.2.3: 4-round average (Lea
 _(v0.2.5: 5-round average; v0.2.4: 5-round average; v0.2.3: 5-round average. All manually collected. 2026-07-12: 4-round average (conns=200, clients=200, Docker monitoring stack stopped).)_
 
 | **Scenario**        | **Metric**  | **v0.2.3**   | **v0.2.4**   | **v0.2.5**   | **Δ (v0.2.4→v0.2.5)** | **0712**      | **Δ (v0.2.5→0712)** |
-| ------------------- | ----------- | ------------ | ------------ | ------------ | --------------------- | ------------ | ------------------- |
+| ------------------- | ----------- | ------------ | ------------ | ------------ | --------------------- | ------------- | ------------------- |
 | Single Client Write | Throughput  | 6,421 ops/s  | 5,245 ops/s  | 5,234 ops/s  | stable                | 9,450 ops/s   | **+80.5%** ✅       |
 |                     | Avg Latency | 0.155 ms     | 0.190 ms     | 0.190 ms     | stable                | 0.105 ms      | **-44.6%** ✅       |
 |                     | p99 Latency | 0.200 ms     | 0.235 ms     | 0.237 ms     | stable                | 0.223 ms      | -6.0% →             |
@@ -214,7 +214,6 @@ read_actor_channel_capacity = 10240
 read_actor_max_drain = 2000
 
 [raft.persistence]
-strategy = "MemFirst"
 flush_policy = { Batch = { idle_flush_interval_ms = 1000 } }
 
 [raft.batching]

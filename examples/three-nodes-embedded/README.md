@@ -84,7 +84,6 @@ default_policy = "LeaseRead"
 lease_duration_ms = 500
 
 [raft.persistence]
-strategy = "MemFirst"
 flush_policy = { Batch = { threshold = 100, interval_ms = 20 } }
 ```
 
