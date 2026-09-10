@@ -822,16 +822,12 @@ fn default_stale_learner_threshold() -> Duration {
     Duration::from_secs(300)
 }
 
-/// Controls when in-memory logs should be flushed to disk.
+/// Interval (ms) between periodic fsyncs on the IO thread. Must be > 0.
 ///
-/// Flush is triggered by whichever comes first:
-/// - An explicit `flush()` call (immediate, no wait).
-/// - `append_entries` calls `write_notify.notify_one()` for an immediate persist+fsync.
-/// - The idle safety-net timer fires after `idle_flush_interval_ms` of inactivity.
-///
-/// `idle_flush_interval_ms` must be greater than zero. It only fires when no
-/// writes have arrived for that duration; normal-path latency is determined by
-/// the fsync execution time (drain-then-fsync architecture).
+/// Writes fsync on their own path (`flush()`, `append_entries` →
+/// `IOTask::Persist`). This timer only re-fsyncs `(durable_index,
+/// memory_max_index]` when the log is idle, so `durable_index` still advances
+/// if a fsync-completion notification is lost.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum FlushPolicy {
     Batch { idle_flush_interval_ms: u64 },

@@ -263,7 +263,7 @@ impl MockStorageEngine {
             } else {
                 data.insert(last_key, new_last_index.to_be_bytes().to_vec());
             }
-            Ok(())
+            Ok(new_last_index)
         });
     }
 

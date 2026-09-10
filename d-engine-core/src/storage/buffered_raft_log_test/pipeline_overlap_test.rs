@@ -437,9 +437,9 @@ async fn test_io_task_replace_range_delegates_to_replace_range_not_truncate() {
 
     // replace_range() must be called exactly once for one conflict resolution
     let rr_counter = replace_range_count.clone();
-    log_store.expect_replace_range().returning(move |_from, _entries| {
+    log_store.expect_replace_range().returning(move |_from, new_entries| {
         rr_counter.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(new_entries.last().map(|e| e.index).unwrap_or(0))
     });
 
     // truncate() must NOT be called — IOTask::ReplaceRange owns the full operation

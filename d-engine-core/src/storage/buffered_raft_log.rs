@@ -12,14 +12,20 @@
 //!
 //! ## Write path
 //!
-//! `append_entries` inserts entries into in-memory SkipMap, calls `write_notify.notify_one()`.
-//! Multiple concurrent writers coalesce into a single IO thread wakeup.
+//! `append_entries` inserts entries into the in-memory SkipMap, then sends a
+//! fire-and-forget `IOTask::Persist` on the same channel that carries `Flush` /
+//! `ReplaceRange` / `Purge` / `Reset` / `Shutdown`. One ordered wakeup source
+//! means the IO thread never races two independent signals for the same pending
+//! work (#446). A write burst's redundant `Persist`s are cheap no-ops: each finds
+//! `persisted_index` already at `memory_max_index` and persists nothing.
 //!
 //! ## IO thread (notify-then-spawn-fsync)
 //!
-//! On wakeup from `write_notify` (`run_batch_turn`):
-//! 1. **Read** — scan SkipMap range `(durable_index, memory_max_index]`
-//! 2. **Persist** — write range to OS page cache via `persist_entries` (no fsync)
+//! On `IOTask::Persist` (`run_storage_tasks`) / `Flush` (`run_flush_turn`):
+//! 1. **Read** — scan the SkipMap range `(persisted_index, memory_max_index]`,
+//!    where `persisted_index` is the IO thread's own page-cache frontier (not
+//!    the round-tripping `durable_index`)
+//! 2. **Persist** — write the range to OS page cache via `persist_entries` (no fsync)
 //! 3. **Dispatch fsync** — `FsyncCoordinator::submit()` hands the fdatasync to a
 //!    `spawn_blocking` task and returns immediately
 //! 4. **Loop** — back to `select!`; the prior fsync runs concurrently in the pool
@@ -39,11 +45,11 @@
 //!
 //! ## Fsync triggers
 //!
-//! 1. **Notify-driven** (normal): `write_notify` → `run_batch_turn`
-//! 2. **Explicit** (flush API): `flush()` → `IOTask::Flush(tx)` → `run_batch_turn` with a reply sender
+//! 1. **Write-driven** (normal): `append_entries` → `IOTask::Persist` → `run_storage_tasks`
+//! 2. **Explicit** (flush API): `flush()` → `IOTask::Flush(tx)` → `run_flush_turn` with a reply sender
 //! 3. **Idle timer** (safety net): `idle_flush_interval_ms` elapsed →
-//!    `persist_pending_range` + `FsyncCoordinator::submit()` directly (not via `run_batch_turn`)
-//! 4. **Shutdown**: `IOTask::Shutdown` → `run_batch_turn`, then `close()` waits
+//!    `persist_pending_range` + `FsyncCoordinator::submit()` directly (not via `run_flush_turn`)
+//! 4. **Shutdown**: `IOTask::Shutdown` → `run_flush_turn`, then `close()` waits
 //!    (bounded by `shutdown_timeout_ms`) for the IO thread's runtime to drain any in-flight fsync
 //!
 //! ## Durability contract
@@ -80,7 +86,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::debug;
@@ -226,6 +231,11 @@ pub enum IOTask {
     /// result (Ok or Err) back to the caller via the oneshot channel.
     /// Replaces the former `FlushNow` + `WaitDurable` two-message dance.
     Flush(oneshot::Sender<Result<()>>),
+    /// Persist the IO thread to persist newly-appended entries. Fire-and-forget,
+    /// carries no data — `append_entries` sends one after each insert. Redundant
+    /// `Persist`s from writes coalesced while the IO thread was busy are drained
+    /// and discarded in a single `run_flush_turn`.
+    Persist,
     /// Shutdown the IO thread
     Shutdown,
 }
@@ -299,10 +309,9 @@ where
     term_segments: TermSegments,
 
     // --- Flush coordination ---
-    /// Coalesced write notification. `append_entries` calls `notify_one()` after
-    /// inserting into the SkipMap. Multiple concurrent writers coalesce into a
-    /// single IO thread wakeup, eliminating per-write kernel cond_signal overhead.
-    pub(crate) write_notify: Arc<Notify>,
+    /// The IO thread's sole inbound channel: `Persist` /  `Flush` / `ReplaceRange` / `Purge` / `Reset` / `Shutdown`. One ordered
+    /// source so the IO thread never races two independent wakeup signals for
+    /// the same pending work (#446).
     pub(crate) command_sender: mpsc::UnboundedSender<IOTask>,
 
     // --- P0: LogFlushed event notification ---
@@ -478,13 +487,16 @@ where
 
         self.insert_to_memory(&entries);
 
-        // Signal the IO thread to persist. Fire-and-forget: the entry is in the
-        // in-memory log and quorum-visible now; the IO thread scans the SkipMap
-        // and persists + fsyncs off this task. Concurrent notify_one() calls
-        // coalesce into one wakeup. RPO=0 is enforced downstream (#446), not
-        // here: commit quorum counts only `durable_index()`, and followers
-        // withhold AppendEntries ACKs until their own `durable_index` catches up.
-        self.write_notify.notify_one();
+        // Persist the IO thread. Fire-and-forget: the entries are already in the
+        // in-memory log and quorum-visible; the IO thread scans the SkipMap and
+        // persists + fsyncs off this task. `Persist` rides the same channel as
+        // `Flush` / `ReplaceRange` / `Shutdown` so the IO thread has one ordered
+        // wakeup source (#446). RPO=0 is enforced downstream — commit quorum
+        // counts only `durable_index()`, and followers withhold AppendEntries
+        // ACKs until their own `durable_index` catches up.
+        self.command_sender
+            .send(IOTask::Persist)
+            .map_err(|e| NetworkError::SingalSendFailed(format!("Persist send failed: {e:?}")))?;
 
         Ok(())
     }
@@ -885,7 +897,6 @@ where
                 last_purged_term: AtomicU64::new(last_purged_term_val),
                 durable_index: AtomicU64::new(disk_len),
                 next_id: AtomicU64::new(disk_len + 1),
-                write_notify: Arc::new(Notify::new()),
                 command_sender: command_sender.clone(),
                 term_first_index,
                 term_last_index,
@@ -949,20 +960,22 @@ where
         arc_self
     }
 
-    /// Notify-driven IO loop.
+    /// Write-driven IO loop.
     ///
-    /// Waits on `write_notify.notified()` for new entries in the SkipMap.
-    /// Multiple `notify_one()` calls while the IO thread is busy (persisting or
-    /// fsyncing) coalesce into a single wakeup, reducing kernel cond_signal overhead
-    /// from one-per-write to one-per-burst.
+    /// A single `select!` consumes one ordered channel of `IOTask`s and a
+    /// backstop timer. `Persist` / `ReplaceRange` / `Purge` / `Reset` go to
+    /// `run_storage_tasks`; `Flush` / `Shutdown` to `run_flush_turn` (which also
+    /// sweeps the queue for one combined fsync). A write burst's extra `Persist`s
+    /// are no-ops — `persisted_index` is already past `memory_max_index`.
     ///
-    /// On each wakeup:
-    ///   1. Read entries in `(durable_index, memory_max_index]` from SkipMap.
+    /// On each `Persist` / `Flush`:
+    ///   1. Read entries in `(persisted_index, memory_max_index]` from the SkipMap.
     ///   2. persist_entries to OS page cache (no fsync).
-    ///   3. Drain any pending control commands from the mpsc channel.
-    ///   4. fsync once — advance durable_index, wake WaitDurable callers.
+    ///   3. Drain any pending control commands from the channel.
+    ///   4. Hand the range to `FsyncCoordinator` for one concurrent fsync.
     ///
-    /// Safety-net timer fires after `idle_flush_interval_ms` of inactivity.
+    /// Backstop timer ticks every `idle_flush_interval_ms` (fixed period, not
+    /// reset by writes; skipped under load — see the safety-net arm).
     async fn batch_processor(
         this: std::sync::Weak<Self>,
         mut receiver: mpsc::UnboundedReceiver<IOTask>,
@@ -979,20 +992,20 @@ where
         // Highest index in OS page cache, awaiting fsync. Reset to 0 after each fsync.
         let mut pending_max: u64 = 0;
 
+        // Highest log index the IO thread has written to the OS page cache —
+        // B-local, the "submitted" watermark sitting between `memory_max_index`
+        // and `durable_index`
+        let mut persisted_index: u64 = this.durable_index.load(Ordering::Acquire);
+
         loop {
             tokio::select! {
-                _ = this.write_notify.notified() => {
-                    if Self::run_batch_turn(&this, &mut receiver, &mut pending_max, Vec::new(), false).await {
-                        break;
-                    }
-                }
                 cmd = receiver.recv() => {
                     let Some(cmd) = cmd else { break };
                     let should_break = match cmd {
-                        IOTask::Shutdown => Self::run_batch_turn(&this, &mut receiver, &mut pending_max, Vec::new(), true).await,
-                        IOTask::Flush(reply) => Self::run_batch_turn(&this, &mut receiver, &mut pending_max, vec![reply], false).await,
+                        IOTask::Shutdown => Self::run_flush_turn(&this, &mut receiver, &mut persisted_index, &mut pending_max, Vec::new(), true).await,
+                        IOTask::Flush(reply) => Self::run_flush_turn(&this, &mut receiver, &mut persisted_index, &mut pending_max, vec![reply], false).await,
                         cmd => {
-                            if Self::run_storage_tasks(cmd, &this, &mut pending_max).await {
+                            if Self::run_storage_tasks(cmd, &this, &mut persisted_index, &mut pending_max).await {
                                 break;
                             }
                             continue;
@@ -1001,68 +1014,80 @@ where
                     if should_break { break; }
                 }
                 _ = safety_timer.tick() => {
-                    let start = this.durable_index.load(Ordering::Acquire) + 1;
+                    let from = this.durable_index.load(Ordering::Acquire) + 1;
                     let end = this.memory_max_index.load(Ordering::Acquire);
-                    let _ = Self::persist_pending_range(&this, start, end, &mut pending_max, "safety-net").await;
-
-                    if pending_max > 0 {
-                        this.fsync_coordinator.submit(&this, pending_max, vec![]);
-                        pending_max = 0;
+                    if let Ok(Some(persisted_to)) =
+                        Self::persist_pending_range(&this, from, end, "safety-net").await
+                    {
+                        persisted_index = persisted_index.max(persisted_to);
+                        this.fsync_coordinator.submit(&this, persisted_to, vec![]);
                     }
                 }
             }
         }
     }
 
-    /// Writes entries in `(from, to]` that haven't reached page cache yet (no
-    /// fsync). Iterates the SkipMap for the range — entries removed by a
-    /// concurrent truncation simply aren't returned, so a stale from/to pair is
-    /// self-correcting and never writes wrong data. Advances `pending_max` on
-    /// success; propagates the error as-is on failure.
+    /// Persists entries in `(from, to]` that aren't in the OS page cache yet
+    /// (no fsync). `from` / `to` are only scan bounds — the caller passes
+    /// `persisted_index + 1` and a `memory_max_index` snapshot.
+    ///
+    /// The SkipMap range scan returns only entries that still exist. If a
+    /// concurrent term-conflict truncation removed the top of `(from, to]`
+    /// between the caller's `memory_max_index` read and this scan, those
+    /// indices are simply absent and never written.
+    ///
+    /// Returns `Some(highest index actually written)` — which may be *below*
+    /// `to` in that truncation-race case — or `None` when the scan found
+    /// nothing. Callers advance their own `persisted_index` / fsync target
+    /// from this value, so neither ever points past a real entry.
     async fn persist_pending_range(
         this: &Arc<Self>,
         from: u64,
         to: u64,
-        pending_max: &mut u64,
         ctx: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         if this.is_poisoned() {
             return Err(Error::Fatal("raft log storage is poisoned".to_string()));
         }
         if from > to {
-            return Ok(());
+            return Ok(None);
         }
         let entries = this.get_entries_range(from..=to)?;
-        if entries.is_empty() {
-            return Ok(());
-        }
-        this.log_store
-            .persist_entries(entries)
-            .await
-            .inspect(|_| {
-                *pending_max = (*pending_max).max(to);
-            })
-            .inspect_err(|e| {
-                error!("{ctx} persist_entries failed: {e:?}");
-                this.mark_poisoned_and_notify(format!("{ctx}: persist_entries failed: {e:?}"));
-            })
+        let Some(highest_written) = entries.last().map(|e| e.index) else {
+            return Ok(None);
+        };
+        this.log_store.persist_entries(entries).await.inspect_err(|e| {
+            error!(
+                persist_path = ctx,
+                from, to, "persist_entries failed: {e:?}"
+            );
+            this.mark_poisoned_and_notify(format!("{ctx}: persist_entries failed: {e:?}"));
+        })?;
+        Ok(Some(highest_written))
     }
 
-    async fn run_batch_turn(
+    async fn run_flush_turn(
         this: &Arc<Self>,
         receiver: &mut mpsc::UnboundedReceiver<IOTask>,
+        persisted_index: &mut u64,
         pending_max: &mut u64,
         mut replies: Vec<oneshot::Sender<Result<()>>>,
         mut seen_shutdown: bool,
     ) -> bool {
-        let start = this.durable_index.load(Ordering::Acquire) + 1;
         let end = this.memory_max_index.load(Ordering::Acquire);
         let mut persist_failed = false;
-        if let Err(e) = Self::persist_pending_range(this, start, end, pending_max, "batch").await {
-            for reply in replies.drain(..) {
-                let _ = reply.send(Err(Error::Fatal(format!("persist_entries failed: {e:?}"))));
+        match Self::persist_pending_range(this, *persisted_index + 1, end, "flush-turn").await {
+            Ok(Some(persisted_to)) => {
+                *persisted_index = persisted_to;
+                *pending_max = (*pending_max).max(persisted_to);
             }
-            persist_failed = true;
+            Ok(None) => {}
+            Err(e) => {
+                for reply in replies.drain(..) {
+                    let _ = reply.send(Err(Error::Fatal(format!("persist_entries failed: {e:?}"))));
+                }
+                persist_failed = true;
+            }
         }
 
         // `seen_shutdown` is not a gate here — regardless of whether the
@@ -1076,8 +1101,12 @@ where
                     seen_shutdown = true;
                 }
                 IOTask::Flush(reply) => replies.push(reply),
+                // A coalesced write. Drop it — the unconditional tail re-scan
+                // below persists everything up to `memory_max_index`, and this
+                // turn ends with a single fsync submit.
+                IOTask::Persist => {}
                 cmd => {
-                    if Self::run_storage_tasks(cmd, this, pending_max).await {
+                    if Self::run_storage_tasks(cmd, this, persisted_index, pending_max).await {
                         for reply in replies {
                             let _ = reply
                                 .send(Err(Error::Fatal("fatal IO error, batch aborted".into())));
@@ -1088,13 +1117,19 @@ where
             }
         }
 
-        // A Flush caller needs everything up to now durable; a command drained
-        // above may have advanced memory_max_index past the leading persist.
-        if !replies.is_empty() && !persist_failed {
-            let start = *pending_max + 1;
+        // Tail re-scan: a discarded `Persist` or a drained command may have moved
+        // memory_max_index past the leading persist. Unconditional since #446 —
+        // for a coalesced write the discarded `Persist` was its only signal; a
+        // Flush reply / final Shutdown drain also need everything up to now.
+        if !persist_failed {
             let end = this.memory_max_index.load(Ordering::Acquire);
-            let _ =
-                Self::persist_pending_range(this, start, end, pending_max, "batch catch-up").await;
+            if let Ok(Some(persisted_to)) =
+                Self::persist_pending_range(this, *persisted_index + 1, end, "flush-turn catch-up")
+                    .await
+            {
+                *persisted_index = persisted_to;
+                *pending_max = (*pending_max).max(persisted_to);
+            }
         }
 
         this.fsync_coordinator.submit(this, *pending_max, replies);
@@ -1115,14 +1150,16 @@ where
         seen_shutdown
     }
 
-    /// Runs one storage-mutating IOTask (ReplaceRange/Purge/Reset)
-    /// against log_store. Flush/Shutdown are intercepted by the caller
-    /// (`batch_processor`) before this is called — unreachable here.
+    /// Handles one non-Flush/Shutdown `IOTask`: `Persist` (persist the SkipMap tail
+    /// then submit it for fsync) or a storage mutation (ReplaceRange/Purge/Reset).
+    /// Flush/Shutdown never reach here: `batch_processor`'s `select!` routes
+    /// them to `run_flush_turn`, whose drain loop also handles them inline.
     ///
     /// Returns `true` if `batch_processor` must exit immediately (fatal IO error).
     async fn run_storage_tasks(
         cmd: IOTask,
         this: &Arc<Self>,
+        persisted_index: &mut u64,
         pending_max: &mut u64,
     ) -> bool {
         match cmd {
@@ -1131,6 +1168,22 @@ where
             }
             IOTask::Shutdown => {
                 unreachable!("Shutdown is always filtered out before reaching run_storage_tasks")
+            }
+            IOTask::Persist => {
+                // A write landed. Persist the new tail and submit it. No queue
+                // drain: a burst's redundant `Persist`s find `persisted_index`
+                // already at `memory_max_index` and no-op here (#446).
+                let end = this.memory_max_index.load(Ordering::Acquire);
+                match Self::persist_pending_range(this, *persisted_index + 1, end, "persist").await
+                {
+                    Ok(Some(persisted_to)) => {
+                        *persisted_index = persisted_to;
+                        this.fsync_coordinator.submit(this, persisted_to, Vec::new());
+                    }
+                    Ok(None) => {}
+                    Err(_) => return true, // poisoned — same exit convention as the mutations below
+                }
+                false
             }
             IOTask::ReplaceRange {
                 truncate_from,
@@ -1145,20 +1198,26 @@ where
                     return true;
                 }
 
-                let max_idx = new_entries.last().map(|e| e.index).unwrap_or(0);
-                let result = this.log_store.replace_range(truncate_from, new_entries).await;
-                if let Err(ref e) = result {
-                    error!("IOTask::ReplaceRange failed (fatal): {e:?}");
-                    this.mark_poisoned_and_notify(format!("ReplaceRange failed: {e:?}"));
-                    let _ = done.send(result);
-                    return true; // signal batch_processor to exit — disk state is corrupted
+                let new_tail = match this.log_store.replace_range(truncate_from, new_entries).await
+                {
+                    Ok(new_tail) => new_tail,
+                    Err(e) => {
+                        error!("IOTask::ReplaceRange failed (fatal): {e:?}");
+                        this.mark_poisoned_and_notify(format!("ReplaceRange failed: {e:?}"));
+                        let _ = done.send(Err(e));
+                        return true;
+                    }
+                };
+                // A real new tail was written — fsync it (fdatasync is whole-WAL,
+                // so it also covers any leading persist from this same turn;
+                // clear pending_max so the turn's final submit doesn't re-send a
+                // now-stale index).
+                if new_tail >= truncate_from {
+                    this.fsync_coordinator.submit(this, new_tail, vec![]);
                 }
-
-                if max_idx > 0 {
-                    *pending_max = (*pending_max).max(max_idx);
-                    this.fsync_coordinator.submit(this, max_idx, vec![]);
-                }
-                let _ = done.send(result);
+                *pending_max = 0;
+                *persisted_index = new_tail; // == truncate_from - 1 when the new tail is empty
+                let _ = done.send(Ok(()));
                 false
             }
             IOTask::Purge { cutoff, done } => {
@@ -1175,6 +1234,9 @@ where
                     let _ = done.send(());
                     return true; // signal batch_processor to exit — disk state is corrupted
                 }
+                // Purged entries were already durable (only applied entries are
+                // purged) — let the persist frontier skip past them (#446).
+                *persisted_index = (*persisted_index).max(cutoff.index);
                 let _ = done.send(());
                 false
             }
@@ -1188,9 +1250,16 @@ where
                     error!("IOTask::Reset failed (fatal): {e:?}");
                     this.mark_poisoned_and_notify(format!("Reset failed: {e:?}"));
                     let _ = done.send(result);
-                    return true; // signal batch_processor to exit — disk state is corrupted
+
+                    // signal batch_processor to exit — disk state is corrupted
+                    return true;
                 }
-                *pending_max = 0; // disk wiped — pending page-cache watermark must be zeroed
+
+                // disk wiped — pending page-cache watermark must be zeroed
+                *pending_max = 0;
+
+                // log wiped — next entry to persist is index 1
+                *persisted_index = 0;
                 let _ = done.send(result);
                 false
             }
