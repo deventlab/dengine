@@ -23,6 +23,8 @@ use crate::PersistenceConfig;
 use d_engine_proto::common::Entry;
 use d_engine_proto::common::LogId;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -1162,5 +1164,301 @@ async fn test_notify_fatal_channel_closed_still_poisons_and_logs() {
         crate::test_utils::logs_contain_globally(&logs, "FatalError delivery failed"),
         "a channel-closed failure to notify must still be observable via logs, \
          not a silent no-op — see notify_fatal()'s error! call"
+    );
+}
+
+/// Efficiency: the IO thread's persist scan must start from its own page-cache
+/// frontier, not from `durable_index`. Since #446 `durable_index` only advances
+/// after an `FsyncCompleted` round-trips through raft.rs's event loop; under
+/// load it lags far behind what the IO thread has already written. If the scan
+/// restarted from `durable_index + 1` on every wakeup, each of N appends would
+/// re-scan and re-`persist_entries` the whole not-yet-durable window — O(N^2)
+/// total work.
+///
+/// This test pins `durable_index` at 0 (no `log_flush_tx`, so no
+/// `FsyncCompleted` is ever consumed) and appends N entries one at a time. The
+/// total number of entries handed to `persist_entries` across all calls must
+/// stay ~N, not ~N^2/2.
+#[tokio::test]
+async fn test_persist_scan_tracks_frontier_not_stuck_durable_index() {
+    let persisted_total = Arc::new(AtomicU64::new(0));
+    let persisted_total_c = persisted_total.clone();
+
+    let mut log_store = MockLogStore::new();
+    log_store.expect_last_index().returning(|| 0);
+    log_store.expect_persist_entries().returning(move |entries| {
+        persisted_total_c.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        Ok(())
+    });
+    log_store.expect_entry().returning(|_| Ok(None));
+    log_store.expect_get_entries().returning(|_| Ok(vec![]));
+    log_store.expect_purge().returning(|_| Ok(()));
+    log_store.expect_load_purge_boundary().returning(|| Ok(None));
+    log_store.expect_reset().returning(|| Ok(()));
+    log_store.expect_truncate().returning(|_| Ok(()));
+    log_store
+        .expect_replace_range()
+        .returning(|from, new_entries| {
+            Ok(new_entries
+                .last()
+                .map(|e| e.index)
+                .unwrap_or(from.saturating_sub(1)))
+        });
+    log_store.expect_is_write_durable().returning(|| false);
+    log_store.expect_flush().returning(|| Ok(()));
+    log_store.expect_flush_async().returning(|| Ok(()));
+
+    let mut meta_store = MockMetaStore::new();
+    meta_store.expect_save_hard_state().returning(|_| Ok(()));
+    meta_store.expect_load_hard_state().returning(|| Ok(None));
+    meta_store.expect_flush().returning(|| Ok(()));
+    meta_store.expect_flush_async().returning(|| Ok(()));
+
+    let storage = Arc::new(MockStorageEngine::from(log_store, meta_store));
+    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        storage,
+    );
+    // No log_flush_tx: FsyncCompleted is never consumed, so durable_index
+    // stays pinned at 0 for the whole test.
+    let raft_log = raft_log.start(receiver, None);
+    std::thread::sleep(Duration::from_millis(10));
+
+    const N: u64 = 100;
+    for i in 1..=N {
+        raft_log
+            .append_entries(vec![Entry {
+                index: i,
+                term: 1,
+                payload: None,
+            }])
+            .await
+            .unwrap();
+        // flush() forces the IO thread to persist up to memory_max_index right
+        // now, so the scan boundary is exercised once per append — deterministic,
+        // no sleeps.
+        raft_log.flush().await.unwrap();
+    }
+
+    assert_eq!(
+        raft_log.durable_index(),
+        0,
+        "durable_index must stay stuck for this test to be meaningful"
+    );
+    let total = persisted_total.load(Ordering::Relaxed);
+    assert!(
+        total < 3 * N,
+        "persist_entries received {total} entries for {N} appends; a frontier-tracking \
+         scan is ~{N}, a durable_index-relative scan would be ~{} (O(N^2))",
+        N * (N + 1) / 2
+    );
+}
+
+/// Cold start: after a restart, `durable_index` starts at the disk length and
+/// the IO thread's persist frontier must start *past* it. The first write's
+/// persist scan begins at `durable_index + 1` — an already-durable entry on
+/// disk must never be handed back to `persist_entries`.
+///
+/// Guards the frontier initialization (`= durable_index`, scans use `+ 1`).
+#[tokio::test]
+async fn test_cold_start_persist_frontier_starts_past_durable_index() {
+    let persist_calls: Arc<Mutex<Vec<Vec<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let mut log_store = MockLogStore::new();
+    log_store.expect_last_index().returning(|| 5); // disk already holds 1..=5
+    log_store.expect_get_entries().returning(|range| {
+        Ok(range
+            .map(|i| Entry {
+                index: i,
+                term: 1,
+                payload: None,
+            })
+            .collect())
+    });
+    {
+        let calls = persist_calls.clone();
+        log_store.expect_persist_entries().returning(move |entries| {
+            calls
+                .lock()
+                .unwrap()
+                .push(entries.iter().map(|e| e.index).collect());
+            Ok(())
+        });
+    }
+    log_store.expect_entry().returning(|_| Ok(None));
+    log_store.expect_purge().returning(|_| Ok(()));
+    log_store.expect_load_purge_boundary().returning(|| Ok(None));
+    log_store.expect_reset().returning(|| Ok(()));
+    log_store.expect_truncate().returning(|_| Ok(()));
+    log_store.expect_replace_range().returning(|from, e| {
+        Ok(e.last().map(|x| x.index).unwrap_or(from.saturating_sub(1)))
+    });
+    log_store.expect_is_write_durable().returning(|| false);
+    log_store.expect_flush().returning(|| Ok(()));
+    log_store.expect_flush_async().returning(|| Ok(()));
+
+    let mut meta_store = MockMetaStore::new();
+    meta_store.expect_save_hard_state().returning(|_| Ok(()));
+    meta_store.expect_load_hard_state().returning(|| Ok(None));
+    meta_store.expect_flush().returning(|| Ok(()));
+    meta_store.expect_flush_async().returning(|| Ok(()));
+
+    let storage = Arc::new(MockStorageEngine::from(log_store, meta_store));
+    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        storage,
+    );
+    let raft_log = raft_log.start(receiver, None);
+    std::thread::sleep(Duration::from_millis(10));
+
+    assert_eq!(
+        raft_log.durable_index(),
+        5,
+        "restart: disk length 5 is treated as durable"
+    );
+
+    // First write after restart. Its persist scan must start at 6.
+    raft_log
+        .append_entries(vec![Entry {
+            index: 6,
+            term: 1,
+            payload: None,
+        }])
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let calls = persist_calls.lock().unwrap().clone();
+    assert!(!calls.is_empty(), "entry 6 must have been persisted");
+    assert!(
+        calls.iter().flatten().all(|&idx| idx >= 6),
+        "cold start: the first persist must scan from durable_index+1 (6), never \
+         re-scan already-durable entry 5. Got: {calls:?}"
+    );
+}
+
+/// The flush turn's unconditional tail re-scan must persist writes that were
+/// coalesced into the turn — a write whose `IOTask::Persist` is dropped in the
+/// drain loop still becomes durable, because the catch-up re-reads
+/// `memory_max_index` and persists everything past the frontier.
+///
+/// Deterministic via a per-call persist gate: every `persist_entries` announces
+/// its indices and blocks until released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn test_flush_turn_catch_up_persists_writes_coalesced_during_the_turn() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<Vec<u64>>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+
+    let mut log_store = MockLogStore::new();
+    log_store.expect_last_index().returning(|| 0);
+    log_store.expect_persist_entries().returning(move |entries| {
+        entered_tx
+            .send(entries.iter().map(|e| e.index).collect())
+            .ok();
+        release_rx.lock().unwrap().recv().ok();
+        Ok(())
+    });
+    log_store.expect_entry().returning(|_| Ok(None));
+    log_store.expect_get_entries().returning(|_| Ok(vec![]));
+    log_store.expect_purge().returning(|_| Ok(()));
+    log_store.expect_load_purge_boundary().returning(|| Ok(None));
+    log_store.expect_reset().returning(|| Ok(()));
+    log_store.expect_truncate().returning(|_| Ok(()));
+    log_store.expect_replace_range().returning(|from, e| {
+        Ok(e.last().map(|x| x.index).unwrap_or(from.saturating_sub(1)))
+    });
+    log_store.expect_is_write_durable().returning(|| false);
+    log_store.expect_flush().returning(|| Ok(()));
+    log_store.expect_flush_async().returning(|| Ok(()));
+
+    let mut meta_store = MockMetaStore::new();
+    meta_store.expect_save_hard_state().returning(|_| Ok(()));
+    meta_store.expect_load_hard_state().returning(|| Ok(None));
+    meta_store.expect_flush().returning(|| Ok(()));
+    meta_store.expect_flush_async().returning(|| Ok(()));
+
+    let storage = Arc::new(MockStorageEngine::from(log_store, meta_store));
+    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        storage,
+    );
+    let (log_flush_tx, mut log_flush_rx) = mpsc::unbounded_channel();
+    let raft_log = raft_log.start(receiver, Some(log_flush_tx));
+    std::thread::sleep(Duration::from_millis(10));
+
+    let e = |i: u64| Entry {
+        index: i,
+        term: 1,
+        payload: None,
+    };
+
+    // 1..=2 persisted (frontier → 2).
+    raft_log.append_entries(vec![e(1), e(2)]).await.unwrap();
+    assert_eq!(entered_rx.recv().unwrap(), vec![1, 2]);
+    release_tx.send(()).unwrap();
+
+    // 3..=4: their Persist is in progress (blocked in persist_entries).
+    raft_log.append_entries(vec![e(3), e(4)]).await.unwrap();
+    assert_eq!(entered_rx.recv().unwrap(), vec![3, 4]);
+
+    // flush() enqueues IOTask::Flush behind the in-progress Persist(3,4).
+    let flush_task = {
+        let rl = raft_log.clone();
+        tokio::spawn(async move { rl.flush().await })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // 5..=6 land while Persist(3,4) is still blocked → their Persist queues
+    // behind Flush.
+    raft_log.append_entries(vec![e(5), e(6)]).await.unwrap();
+    release_tx.send(()).unwrap(); // release Persist(3,4) → frontier → 4
+
+    // IO thread moves to Flush → run_flush_turn. Leading persist covers 5,6.
+    assert_eq!(entered_rx.recv().unwrap(), vec![5, 6]);
+
+    // 7..=8 land now — after run_flush_turn read memory_max for its leading
+    // persist, before its drain loop. Their Persist queues behind Flush and
+    // will be dropped in the drain loop.
+    raft_log.append_entries(vec![e(7), e(8)]).await.unwrap();
+    release_tx.send(()).unwrap(); // release leading persist(5,6) → frontier → 6
+
+    // The drain loop drops Persist(5,6) and Persist(7,8); the unconditional
+    // tail re-scan then persists 7,8.
+    assert_eq!(
+        entered_rx.recv().unwrap(),
+        vec![7, 8],
+        "flush turn's tail re-scan must persist 7,8 whose Persist was dropped"
+    );
+    release_tx.send(()).unwrap();
+
+    flush_task.await.unwrap().unwrap();
+    while let Ok(ev) = log_flush_rx.try_recv() {
+        if let crate::InternalEvent::FsyncCompleted { index, term } = ev {
+            raft_log.try_advance_durable_index(index, term);
+        }
+    }
+    assert_eq!(
+        raft_log.durable_index(),
+        8,
+        "7,8 (coalesced into the flush turn) must be durable via the catch-up"
     );
 }

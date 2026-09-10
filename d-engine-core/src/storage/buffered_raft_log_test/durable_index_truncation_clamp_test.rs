@@ -6,13 +6,17 @@
 //! check, and the `FsyncCoordinator` generation fence bumped by `remove_range`.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use d_engine_proto::common::Entry;
 
 use crate::storage::raft_log::RaftLog;
 use crate::test_utils::BufferedRaftLogTestContext;
-use crate::{BufferedRaftLog, FlushPolicy, MockStorageEngine, MockTypeConfig, PersistenceConfig};
+use crate::{
+    BufferedRaftLog, FlushPolicy, MockLogStore, MockMetaStore, MockStorageEngine, MockTypeConfig,
+    PersistenceConfig,
+};
 
 fn entry(
     index: u64,
@@ -158,5 +162,150 @@ async fn test_stale_persist_after_truncation_does_not_advance_durable_index() {
         raft_log.durable_index(),
         2,
         "durable_index must land on the post-truncation tail (2), not the stale 10"
+    );
+}
+
+/// `persist_pending_range` must report the highest index it *actually wrote*,
+/// not the upper scan bound it was handed. The two differ during a truncation
+/// race: the IO thread latched `memory_max_index` = 10 (an old leader had sent
+/// 8, 9, 10), then a term-conflict truncation removed everything above 7 before
+/// the SkipMap scan ran. Asking to persist `(4, 10]` then writes only 5, 6, 7.
+///
+/// Returning the bound (10) would push the caller's `persisted_index` and the
+/// fsync target past entries that never reached disk — a redundant fdatasync
+/// plus a spurious `FsyncCompleted{10}` that the term check then has to reject.
+/// Reporting 7 keeps every downstream watermark on real data.
+#[tokio::test]
+async fn test_persist_pending_range_reports_written_max_not_scan_bound() {
+    let storage = Arc::new(MockStorageEngine::with_id(
+        "persist_pending_range_reports_written_max".into(),
+    ));
+    // No `.start()` — drive `persist_pending_range` directly, no IO thread.
+    let (raft_log, _receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        storage,
+    );
+    let raft_log = Arc::new(raft_log);
+
+    raft_log
+        .append_entries((1..=7).map(|i| entry(i, 1)).collect())
+        .await
+        .unwrap();
+
+    // Scan bound is 10 (stale latch); the SkipMap holds only 1..=7.
+    let written = BufferedRaftLog::persist_pending_range(&raft_log, 5, 10, "test")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        written,
+        Some(7),
+        "must report the highest index actually written (7), not the scan bound (10)"
+    );
+}
+
+/// After a term-conflict truncation, the IO thread's persist frontier must land
+/// *past* the new tail — not on it. `IOTask::ReplaceRange` already wrote (and
+/// fsynced) the new tail via `replace_range`; the next write's persist scan must
+/// start at `new_tail + 1`. If the frontier is left *at* `new_tail`, every
+/// subsequent write re-scans and re-`persist_entries` that one boundary entry
+/// (and re-submits a redundant fsync for it) — the exact waste #446 removes.
+///
+/// Guards the "highest-persisted" watermark semantics: `ReplaceRange` sets the
+/// watermark to `new_tail`, and scans start at `watermark + 1`.
+#[tokio::test]
+async fn test_persist_frontier_skips_new_tail_after_truncation() {
+    // Records the index list of every persist_entries() call.
+    let persist_calls: Arc<Mutex<Vec<Vec<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let mut log_store = MockLogStore::new();
+    log_store.expect_last_index().returning(|| 0);
+    {
+        let calls = persist_calls.clone();
+        log_store.expect_persist_entries().returning(move |entries| {
+            calls
+                .lock()
+                .unwrap()
+                .push(entries.iter().map(|e| e.index).collect());
+            Ok(())
+        });
+    }
+    log_store
+        .expect_replace_range()
+        .returning(|from, new_entries| {
+            Ok(new_entries
+                .last()
+                .map(|e| e.index)
+                .unwrap_or(from.saturating_sub(1)))
+        });
+    log_store.expect_truncate().returning(|_| Ok(()));
+    log_store.expect_entry().returning(|_| Ok(None));
+    log_store.expect_get_entries().returning(|_| Ok(vec![]));
+    log_store.expect_purge().returning(|_| Ok(()));
+    log_store.expect_load_purge_boundary().returning(|| Ok(None));
+    log_store.expect_reset().returning(|| Ok(()));
+    log_store.expect_is_write_durable().returning(|| false);
+    log_store.expect_flush().returning(|| Ok(()));
+    log_store.expect_flush_async().returning(|| Ok(()));
+
+    let mut meta_store = MockMetaStore::new();
+    meta_store.expect_save_hard_state().returning(|_| Ok(()));
+    meta_store.expect_load_hard_state().returning(|| Ok(None));
+    meta_store.expect_flush().returning(|| Ok(()));
+    meta_store.expect_flush_async().returning(|| Ok(()));
+
+    let storage = Arc::new(MockStorageEngine::from(log_store, meta_store));
+    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        storage,
+    );
+    let raft_log = raft_log.start(receiver, None);
+    std::thread::sleep(Duration::from_millis(10));
+
+    // Old leader (term 1): entries 1..=10, persisted.
+    raft_log
+        .append_entries((1..=10).map(|i| entry(i, 1)).collect())
+        .await
+        .unwrap();
+    raft_log.flush().await.unwrap();
+
+    // New leader (term 2): conflict at index 6 → truncate [6..], replace with
+    // [6, 7] (term 2). `filter_out_conflicts_and_append` awaits the
+    // `IOTask::ReplaceRange` reply, so the frontier is at new-tail 7 on return.
+    raft_log
+        .filter_out_conflicts_and_append(5, 1, vec![entry(6, 2), entry(7, 2)])
+        .await
+        .unwrap();
+
+    // Only care about persist calls from here on — no flush() in between, so the
+    // next append's `IOTask::Persist` is the first thing to touch the frontier.
+    persist_calls.lock().unwrap().clear();
+
+    // Next write extends the log. Its persist scan must start at 8, not 7.
+    raft_log
+        .append_entries((8..=10).map(|i| entry(i, 2)).collect())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let calls = persist_calls.lock().unwrap().clone();
+    let re_persisted_tail = calls.iter().flatten().any(|&idx| idx <= 7);
+    assert!(
+        !re_persisted_tail,
+        "after ReplaceRange set the frontier at new-tail 7, the next persist must \
+         start at 8 — entry 7 (or below) must not be handed to persist_entries again. \
+         Got calls: {calls:?}"
     );
 }

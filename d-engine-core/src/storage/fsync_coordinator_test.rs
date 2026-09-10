@@ -609,3 +609,72 @@ fn test_run_until_caught_up_coalesces_queued_submits_into_one_flush() {
         "both queued replies must resolve to Ok"
     );
 }
+
+/// A single fsync round can end up covering a range whose *top* index was
+/// truncated away after being submitted (a stale pre-truncation persist),
+/// folded together with a *lower* index that is still valid. The coordinator
+/// collapses the round to one `(max_index, max_term)` pair reported as
+/// `FsyncCompleted` — if that pair is the stale top, content-validation on the
+/// drain side rejects it and the valid lower index gets **no report at all**,
+/// stranding `durable_index`.
+///
+/// Deterministic, IO-thread-free repro of the `test_stale_persist_after_
+/// truncation_does_not_advance_durable_index` failure. Post-truncation log is
+/// `[1, 2]`; `pending_max` holds the stale `10` (its entry is gone) with the
+/// valid `2` folded in. One round must still let `durable_index` reach 2.
+///
+/// RED until `FsyncCoordinator` derives the report from the truncation-aware
+/// persist frontier instead of the coalescing `pending_max` accumulator.
+#[test]
+fn test_run_until_caught_up_reports_valid_frontier_when_batch_top_is_stale() {
+    let (storage, _flush_call_count) = MockStorageEngine::not_durable(
+        "run_until_caught_up_reports_valid_frontier_when_batch_top_is_stale".into(),
+    );
+    let coord = FsyncCoordinator::new();
+    let (raft_log, receiver) = BufferedRaftLog::<MockTypeConfig>::new(
+        1,
+        PersistenceConfig {
+            flush_policy: FlushPolicy::Batch {
+                idle_flush_interval_ms: 60_000,
+            },
+            shutdown_timeout_ms: 5000,
+        },
+        Arc::new(storage),
+    );
+    let (log_flush_tx, mut log_flush_rx) = mpsc::unbounded_channel();
+    let raft_log = raft_log.start(receiver, Some(log_flush_tx));
+
+    // Post-truncation log: entries 1..=2 only. Index 10 is gone.
+    {
+        let mut e = raft_log.entries.write();
+        for i in 1..=2 {
+            e.insert(
+                i,
+                Entry {
+                    index: i,
+                    term: 1,
+                    payload: None,
+                },
+            );
+        }
+    }
+    raft_log.set_memory_max_index_for_test(2);
+
+    // A stale `submit(10)` and a valid `submit(2)` folded into one round
+    // (`fetch_max(10)` then `fetch_max(2)` => 10).
+    coord.inflight.store(true, Ordering::Release);
+    coord.pending_max.store(10, Ordering::Release);
+
+    coord.run_until_caught_up(&raft_log);
+
+    while let Ok(InternalEvent::FsyncCompleted { index, term }) = log_flush_rx.try_recv() {
+        raft_log.try_advance_durable_index(index, term);
+    }
+
+    assert_eq!(
+        raft_log.durable_index.load(Ordering::Acquire),
+        2,
+        "the fsync covered index 2 (valid) and index 10 (truncated); durable_index \
+         must still reach 2 — a stale batch top must not swallow the valid frontier"
+    );
+}
